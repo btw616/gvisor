@@ -244,7 +244,22 @@ func (app *runApp) execute(t *Task) taskRunState {
 
 	region := trace.StartRegion(t.traceContext, runRegion)
 	t.accountTaskGoroutineEnter(TaskGoroutineRunningApp)
-	info, at, err := t.p.Switch(t.MemoryManager().AddressSpace(), t.Arch(), t.rseqCPU)
+
+	var info *arch.SignalInfo
+	var at usermem.AccessType
+	var err error
+
+	as := t.MemoryManager().AddressSpace()
+	ac := t.Arch()
+	regs := &ac.StateData().Regs
+
+	for {
+		info, at, err = t.p.Switch(as, ac, t.rseqCPU)
+		if err != nil || regs.Rax != 777777 {
+			break
+		}
+		regs.Rax = 123456
+	}
 	t.accountTaskGoroutineLeave(TaskGoroutineRunningApp)
 	region.End()
 
