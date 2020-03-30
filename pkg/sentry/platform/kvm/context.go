@@ -68,7 +68,16 @@ func (c *context) Switch(as platform.AddressSpace, ac arch.Context, _ int32) (*a
 	}
 
 	// Take the blue pill.
-	at, err := cpu.SwitchToUser(switchOpts, &c.info)
+	var at usermem.AccessType
+	var err error
+
+	for {
+		at, err = cpu.SwitchToUser(switchOpts, &c.info)
+		if err != nil || switchOpts.Registers.Rax != 777777 {
+			break
+		}
+		switchOpts.Registers.Rax = 123456
+	}
 
 	// Clear the address space.
 	cpu.active.set(nil)
