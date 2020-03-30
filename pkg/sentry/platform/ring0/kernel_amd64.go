@@ -199,11 +199,37 @@ func (c *CPU) SwitchToUser(switchOpts SwitchOpts) (vector Vector) {
 	writeCR3(uintptr(userCR3))                       // Change to user address space.
 	if switchOpts.FullRestore {
 		vector = iret(c, regs)
+		writeCR3(uintptr(kernelCR3))
+		jumpToUser()
 	} else {
-		vector = sysret(c, regs)
+		for {
+			vector = sysret(c, regs)
+			writeCR3(uintptr(kernelCR3))
+			jumpToUser()
+			if vector != Syscall || regs.Rax != 777777 {
+				break
+			}
+			if switchOpts.Flush || switchOpts.UserPCID == 0 || switchOpts.KernelPCID == 0 {
+				break
+			}
+
+			//SaveFloatingPoint(switchOpts.FloatingPointState)
+			//WriteFS(uintptr(c.registers.Fs_base))
+
+			regs.Rax = 123456
+			regs.Eflags &= ^uint64(UserFlagsClear)
+			regs.Eflags |= UserFlagsSet
+			regs.Cs = uint64(Ucode64)
+			regs.Ss = uint64(Udata)
+
+			swapgs()
+			//WriteFS(uintptr(regs.Fs_base))
+			//WriteGS(uintptr(regs.Gs_base))
+			//LoadFloatingPoint(switchOpts.FloatingPointState)
+			jumpToKernel()
+			writeCR3(uintptr(userCR3))
+		}
 	}
-	writeCR3(uintptr(kernelCR3))                     // Return to kernel address space.
-	jumpToUser()                                     // Return to lower half.
 	SaveFloatingPoint(switchOpts.FloatingPointState) // Copy out floating point.
 	WriteFS(uintptr(c.registers.Fs_base))            // Restore kernel FS.
 	return
