@@ -236,7 +236,13 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo) 
 	// allocations occur.
 	entersyscall()
 	bluepill(c)
-	vector = c.CPU.SwitchToUser(switchOpts)
+	for {
+		vector = c.CPU.SwitchToUser(switchOpts)
+		if vector != ring0.Syscall || switchOpts.Registers.Rax != 777777 {
+			break
+		}
+		switchOpts.Registers.Rax = 123456
+	}
 	exitsyscall()
 
 	switch vector {
