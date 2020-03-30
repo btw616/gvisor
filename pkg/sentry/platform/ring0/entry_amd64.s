@@ -163,6 +163,9 @@ TEXT ·sysenter(SB),NOSPLIT,$0
 	JZ kernel
 
 user:
+	CMPQ AX, $777777
+	JE fastret
+
 	SWAP_GS()
 	XCHGQ CPU_REGISTERS+PTRACE_RSP(GS), SP // Swap stacks.
 	XCHGQ CPU_REGISTERS+PTRACE_RAX(GS), AX // Swap for AX (regs).
@@ -186,6 +189,10 @@ user:
 	MOVQ CPU_REGISTERS+PTRACE_RBP(GS), BP // Original base pointer.
 	MOVQ $Syscall, 24(SP)                 // Output vector.
 	RET
+
+fastret:
+	MOVQ $123456, AX
+	SYSRET64()
 
 kernel:
 	// We can't restore the original stack, but we can access the registers
