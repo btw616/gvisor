@@ -28,11 +28,19 @@ http_archive(
     ],
 )
 
-load("@io_bazel_rules_go//go:deps.bzl", "go_register_toolchains", "go_rules_dependencies")
+load("@io_bazel_rules_go//go:deps.bzl", "go_register_toolchains", "go_rules_dependencies", "go_download_sdk")
 
 go_rules_dependencies()
 
-go_register_toolchains(go_version = "1.14.2")
+go_download_sdk(
+    name = "go_sdk",
+    urls = [
+        "file:///tmp/go.tgz",
+    ],
+    sdks = {
+        "linux_amd64": ("go.tgz", "a69e73942b4432b7e3475d2b84354f0657496efef2b3099ac0ddbae3f806edaf"),
+    },
+)
 
 load("@bazel_gazelle//:deps.bzl", "gazelle_dependencies", "go_repository")
 

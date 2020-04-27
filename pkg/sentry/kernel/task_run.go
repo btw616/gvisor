@@ -56,6 +56,8 @@ type taskRunState interface {
 // make it visible in stack dumps. A goroutine for a given task can be identified
 // searching for Task.run()'s argument value.
 func (t *Task) run(threadID uintptr) {
+	runtime.DedicateOSThread()
+
 	// Construct t.blockingTimer here. We do this here because we can't
 	// reconstruct t.blockingTimer during restore in Task.afterLoad(), because
 	// kernel.timekeeper.SetClocks() hasn't been called yet.
@@ -100,6 +102,7 @@ func (t *Task) run(threadID uintptr) {
 
 			// Keep argument alive because stack trace for dead variables may not be correct.
 			runtime.KeepAlive(threadID)
+			runtime.UndedicateOSThread()
 			return
 		}
 	}
