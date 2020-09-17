@@ -21,13 +21,13 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	"gvisor.dev/gvisor/pkg/abi"
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/bits"
 	"gvisor.dev/gvisor/pkg/eventchannel"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/seccomp"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
@@ -91,7 +91,7 @@ func iovecs(t *kernel.Task, addr usermem.Addr, iovcnt int, printContent bool, ma
 		}
 
 		b := make([]byte, size)
-		amt, err := t.CopyIn(ar.Start, b)
+		amt, err := t.CopyInBytes(ar.Start, b)
 		if err != nil {
 			iovs[i] = fmt.Sprintf("{base=%#x, len=%d, %q..., error decoding string: %v}", ar.Start, ar.Length(), b[:amt], err)
 			continue
@@ -118,7 +118,7 @@ func dump(t *kernel.Task, addr usermem.Addr, size uint, maximumBlobSize uint) st
 	}
 
 	b := make([]byte, size)
-	amt, err := t.CopyIn(addr, b)
+	amt, err := t.CopyInBytes(addr, b)
 	if err != nil {
 		return fmt.Sprintf("%#x (error decoding string: %s)", addr, err)
 	}
@@ -147,14 +147,14 @@ func fd(t *kernel.Task, fd int32) string {
 
 	root := t.FSContext().RootDirectory()
 	if root != nil {
-		defer root.DecRef()
+		defer root.DecRef(t)
 	}
 
 	if fd == linux.AT_FDCWD {
 		wd := t.FSContext().WorkingDirectory()
 		var name string
 		if wd != nil {
-			defer wd.DecRef()
+			defer wd.DecRef(t)
 			name, _ = wd.FullName(root)
 		} else {
 			name = "(unknown cwd)"
@@ -167,7 +167,7 @@ func fd(t *kernel.Task, fd int32) string {
 		// Cast FD to uint64 to avoid printing negative hex.
 		return fmt.Sprintf("%#x (bad FD)", uint64(fd))
 	}
-	defer file.DecRef()
+	defer file.DecRef(t)
 
 	name, _ := file.Dirent.FullName(root)
 	return fmt.Sprintf("%#x %s", fd, name)
@@ -175,12 +175,12 @@ func fd(t *kernel.Task, fd int32) string {
 
 func fdVFS2(t *kernel.Task, fd int32) string {
 	root := t.FSContext().RootDirectoryVFS2()
-	defer root.DecRef()
+	defer root.DecRef(t)
 
 	vfsObj := root.Mount().Filesystem().VirtualFilesystem()
 	if fd == linux.AT_FDCWD {
 		wd := t.FSContext().WorkingDirectoryVFS2()
-		defer wd.DecRef()
+		defer wd.DecRef(t)
 
 		name, _ := vfsObj.PathnameWithDeleted(t, root, wd)
 		return fmt.Sprintf("AT_FDCWD %s", name)
@@ -191,7 +191,7 @@ func fdVFS2(t *kernel.Task, fd int32) string {
 		// Cast FD to uint64 to avoid printing negative hex.
 		return fmt.Sprintf("%#x (bad FD)", uint64(fd))
 	}
-	defer file.DecRef()
+	defer file.DecRef(t)
 
 	name, _ := vfsObj.PathnameWithDeleted(t, root, file.VirtualDentry())
 	return fmt.Sprintf("%#x %s", fd, name)
@@ -199,7 +199,7 @@ func fdVFS2(t *kernel.Task, fd int32) string {
 
 func fdpair(t *kernel.Task, addr usermem.Addr) string {
 	var fds [2]int32
-	_, err := t.CopyIn(addr, &fds)
+	_, err := primitive.CopyInt32SliceIn(t, addr, fds[:])
 	if err != nil {
 		return fmt.Sprintf("%#x (error decoding fds: %s)", addr, err)
 	}
@@ -209,7 +209,7 @@ func fdpair(t *kernel.Task, addr usermem.Addr) string {
 
 func uname(t *kernel.Task, addr usermem.Addr) string {
 	var u linux.UtsName
-	if _, err := t.CopyIn(addr, &u); err != nil {
+	if _, err := u.CopyIn(t, addr); err != nil {
 		return fmt.Sprintf("%#x (error decoding utsname: %s)", addr, err)
 	}
 
@@ -222,7 +222,7 @@ func utimensTimespec(t *kernel.Task, addr usermem.Addr) string {
 	}
 
 	var tim linux.Timespec
-	if _, err := t.CopyIn(addr, &tim); err != nil {
+	if _, err := tim.CopyIn(t, addr); err != nil {
 		return fmt.Sprintf("%#x (error decoding timespec: %s)", addr, err)
 	}
 
@@ -244,7 +244,7 @@ func timespec(t *kernel.Task, addr usermem.Addr) string {
 	}
 
 	var tim linux.Timespec
-	if _, err := t.CopyIn(addr, &tim); err != nil {
+	if _, err := tim.CopyIn(t, addr); err != nil {
 		return fmt.Sprintf("%#x (error decoding timespec: %s)", addr, err)
 	}
 	return fmt.Sprintf("%#x {sec=%v nsec=%v}", addr, tim.Sec, tim.Nsec)
@@ -256,7 +256,7 @@ func timeval(t *kernel.Task, addr usermem.Addr) string {
 	}
 
 	var tim linux.Timeval
-	if _, err := t.CopyIn(addr, &tim); err != nil {
+	if _, err := tim.CopyIn(t, addr); err != nil {
 		return fmt.Sprintf("%#x (error decoding timeval: %s)", addr, err)
 	}
 
@@ -268,8 +268,8 @@ func utimbuf(t *kernel.Task, addr usermem.Addr) string {
 		return "null"
 	}
 
-	var utim syscall.Utimbuf
-	if _, err := t.CopyIn(addr, &utim); err != nil {
+	var utim linux.Utime
+	if _, err := utim.CopyIn(t, addr); err != nil {
 		return fmt.Sprintf("%#x (error decoding utimbuf: %s)", addr, err)
 	}
 
@@ -282,7 +282,7 @@ func stat(t *kernel.Task, addr usermem.Addr) string {
 	}
 
 	var stat linux.Stat
-	if _, err := t.CopyIn(addr, &stat); err != nil {
+	if _, err := stat.CopyIn(t, addr); err != nil {
 		return fmt.Sprintf("%#x (error decoding stat: %s)", addr, err)
 	}
 	return fmt.Sprintf("%#x {dev=%d, ino=%d, mode=%s, nlink=%d, uid=%d, gid=%d, rdev=%d, size=%d, blksize=%d, blocks=%d, atime=%s, mtime=%s, ctime=%s}", addr, stat.Dev, stat.Ino, linux.FileMode(stat.Mode), stat.Nlink, stat.UID, stat.GID, stat.Rdev, stat.Size, stat.Blksize, stat.Blocks, time.Unix(stat.ATime.Sec, stat.ATime.Nsec), time.Unix(stat.MTime.Sec, stat.MTime.Nsec), time.Unix(stat.CTime.Sec, stat.CTime.Nsec))
@@ -330,7 +330,7 @@ func rusage(t *kernel.Task, addr usermem.Addr) string {
 	}
 
 	var ru linux.Rusage
-	if _, err := t.CopyIn(addr, &ru); err != nil {
+	if _, err := ru.CopyIn(t, addr); err != nil {
 		return fmt.Sprintf("%#x (error decoding rusage: %s)", addr, err)
 	}
 	return fmt.Sprintf("%#x %+v", addr, ru)
@@ -342,7 +342,7 @@ func capHeader(t *kernel.Task, addr usermem.Addr) string {
 	}
 
 	var hdr linux.CapUserHeader
-	if _, err := t.CopyIn(addr, &hdr); err != nil {
+	if _, err := hdr.CopyIn(t, addr); err != nil {
 		return fmt.Sprintf("%#x (error decoding header: %s)", addr, err)
 	}
 
@@ -367,7 +367,7 @@ func capData(t *kernel.Task, hdrAddr, dataAddr usermem.Addr) string {
 	}
 
 	var hdr linux.CapUserHeader
-	if _, err := t.CopyIn(hdrAddr, &hdr); err != nil {
+	if _, err := hdr.CopyIn(t, hdrAddr); err != nil {
 		return fmt.Sprintf("%#x (error decoding header: %v)", dataAddr, err)
 	}
 
@@ -376,7 +376,7 @@ func capData(t *kernel.Task, hdrAddr, dataAddr usermem.Addr) string {
 	switch hdr.Version {
 	case linux.LINUX_CAPABILITY_VERSION_1:
 		var data linux.CapUserData
-		if _, err := t.CopyIn(dataAddr, &data); err != nil {
+		if _, err := data.CopyIn(t, dataAddr); err != nil {
 			return fmt.Sprintf("%#x (error decoding data: %v)", dataAddr, err)
 		}
 		p = uint64(data.Permitted)
@@ -384,7 +384,7 @@ func capData(t *kernel.Task, hdrAddr, dataAddr usermem.Addr) string {
 		e = uint64(data.Effective)
 	case linux.LINUX_CAPABILITY_VERSION_2, linux.LINUX_CAPABILITY_VERSION_3:
 		var data [2]linux.CapUserData
-		if _, err := t.CopyIn(dataAddr, &data); err != nil {
+		if _, err := linux.CopyCapUserDataSliceIn(t, dataAddr, data[:]); err != nil {
 			return fmt.Sprintf("%#x (error decoding data: %v)", dataAddr, err)
 		}
 		p = uint64(data[0].Permitted) | (uint64(data[1].Permitted) << 32)
@@ -719,7 +719,7 @@ func (s SyscallMap) SyscallEnter(t *kernel.Task, sysno uintptr, args arch.Syscal
 // SyscallExit implements kernel.Stracer.SyscallExit. It logs the syscall
 // exit trace.
 func (s SyscallMap) SyscallExit(context interface{}, t *kernel.Task, sysno, rval uintptr, err error) {
-	errno := t.ExtractErrno(err, int(sysno))
+	errno := kernel.ExtractErrno(err, int(sysno))
 	c := context.(*syscallContext)
 
 	elapsed := time.Since(c.start)
@@ -778,9 +778,6 @@ func (s SyscallMap) Name(sysno uintptr) string {
 //
 // N.B. This is not in an init function because we can't be sure all syscall
 // tables are registered with the kernel when init runs.
-//
-// TODO(gvisor.dev/issue/155): remove kernel package dependencies from this
-// package and have the kernel package self-initialize all syscall tables.
 func Initialize() {
 	for _, table := range kernel.SyscallTables() {
 		// Is this known?

@@ -24,9 +24,10 @@ import (
 	ktime "gvisor.dev/gvisor/pkg/sentry/kernel/time"
 	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserror"
-	"gvisor.dev/gvisor/pkg/usermem"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
+
+var sizeofEpollEvent = (*linux.EpollEvent)(nil).SizeBytes()
 
 // EpollCreate1 implements Linux syscall epoll_create1(2).
 func EpollCreate1(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallControl, error) {
@@ -35,11 +36,11 @@ func EpollCreate1(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.
 		return 0, nil, syserror.EINVAL
 	}
 
-	file, err := t.Kernel().VFS().NewEpollInstanceFD()
+	file, err := t.Kernel().VFS().NewEpollInstanceFD(t)
 	if err != nil {
 		return 0, nil, err
 	}
-	defer file.DecRef()
+	defer file.DecRef(t)
 
 	fd, err := t.NewFDFromVFS2(0, file, kernel.FDFlags{
 		CloseOnExec: flags&linux.EPOLL_CLOEXEC != 0,
@@ -60,11 +61,11 @@ func EpollCreate(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.S
 		return 0, nil, syserror.EINVAL
 	}
 
-	file, err := t.Kernel().VFS().NewEpollInstanceFD()
+	file, err := t.Kernel().VFS().NewEpollInstanceFD(t)
 	if err != nil {
 		return 0, nil, err
 	}
-	defer file.DecRef()
+	defer file.DecRef(t)
 
 	fd, err := t.NewFDFromVFS2(0, file, kernel.FDFlags{})
 	if err != nil {
@@ -84,7 +85,7 @@ func EpollCtl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 	if epfile == nil {
 		return 0, nil, syserror.EBADF
 	}
-	defer epfile.DecRef()
+	defer epfile.DecRef(t)
 	ep, ok := epfile.Impl().(*vfs.EpollInstance)
 	if !ok {
 		return 0, nil, syserror.EINVAL
@@ -93,7 +94,7 @@ func EpollCtl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 	if file == nil {
 		return 0, nil, syserror.EBADF
 	}
-	defer file.DecRef()
+	defer file.DecRef(t)
 	if epfile == file {
 		return 0, nil, syserror.EINVAL
 	}
@@ -101,14 +102,14 @@ func EpollCtl(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysc
 	var event linux.EpollEvent
 	switch op {
 	case linux.EPOLL_CTL_ADD:
-		if err := event.CopyIn(t, eventAddr); err != nil {
+		if _, err := event.CopyIn(t, eventAddr); err != nil {
 			return 0, nil, err
 		}
 		return 0, nil, ep.AddInterest(file, fd, event)
 	case linux.EPOLL_CTL_DEL:
 		return 0, nil, ep.DeleteInterest(file, fd)
 	case linux.EPOLL_CTL_MOD:
-		if err := event.CopyIn(t, eventAddr); err != nil {
+		if _, err := event.CopyIn(t, eventAddr); err != nil {
 			return 0, nil, err
 		}
 		return 0, nil, ep.ModifyInterest(file, fd, event)
@@ -124,7 +125,7 @@ func EpollWait(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sys
 	maxEvents := int(args[2].Int())
 	timeout := int(args[3].Int())
 
-	const _EP_MAX_EVENTS = math.MaxInt32 / sizeofEpollEvent // Linux: fs/eventpoll.c:EP_MAX_EVENTS
+	var _EP_MAX_EVENTS = math.MaxInt32 / sizeofEpollEvent // Linux: fs/eventpoll.c:EP_MAX_EVENTS
 	if maxEvents <= 0 || maxEvents > _EP_MAX_EVENTS {
 		return 0, nil, syserror.EINVAL
 	}
@@ -133,55 +134,32 @@ func EpollWait(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sys
 	if epfile == nil {
 		return 0, nil, syserror.EBADF
 	}
-	defer epfile.DecRef()
+	defer epfile.DecRef(t)
 	ep, ok := epfile.Impl().(*vfs.EpollInstance)
 	if !ok {
 		return 0, nil, syserror.EINVAL
 	}
 
-	// Use a fixed-size buffer in a loop, instead of make([]linux.EpollEvent,
-	// maxEvents), so that the buffer can be allocated on the stack.
+	// Allocate space for a few events on the stack for the common case in
+	// which we don't have too many events.
 	var (
-		events       [16]linux.EpollEvent
-		total        int
+		eventsArr    [16]linux.EpollEvent
 		ch           chan struct{}
 		haveDeadline bool
 		deadline     ktime.Time
 	)
 	for {
-		batchEvents := len(events)
-		if batchEvents > maxEvents {
-			batchEvents = maxEvents
+		events := ep.ReadEvents(eventsArr[:0], maxEvents)
+		if len(events) != 0 {
+			copiedBytes, err := linux.CopyEpollEventSliceOut(t, eventsAddr, events)
+			copiedEvents := copiedBytes / sizeofEpollEvent // rounded down
+			if copiedEvents != 0 {
+				return uintptr(copiedEvents), nil, nil
+			}
+			return 0, nil, err
 		}
-		n := ep.ReadEvents(events[:batchEvents])
-		maxEvents -= n
-		if n != 0 {
-			// Copy what we read out.
-			copiedEvents, err := copyOutEvents(t, eventsAddr, events[:n])
-			eventsAddr += usermem.Addr(copiedEvents * sizeofEpollEvent)
-			total += copiedEvents
-			if err != nil {
-				if total != 0 {
-					return uintptr(total), nil, nil
-				}
-				return 0, nil, err
-			}
-			// If we've filled the application's event buffer, we're done.
-			if maxEvents == 0 {
-				return uintptr(total), nil, nil
-			}
-			// Loop if we read a full batch, under the expectation that there
-			// may be more events to read.
-			if n == batchEvents {
-				continue
-			}
-		}
-		// We get here if n != batchEvents. If we read any number of events
-		// (just now, or in a previous iteration of this loop), or if timeout
-		// is 0 (such that epoll_wait should be non-blocking), return the
-		// events we've read so far to the application.
-		if total != 0 || timeout == 0 {
-			return uintptr(total), nil, nil
+		if timeout == 0 {
+			return 0, nil, nil
 		}
 		// In the first iteration of this loop, register with the epoll
 		// instance for readability events, but then immediately continue the
@@ -204,8 +182,6 @@ func EpollWait(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sys
 				if err == syserror.ETIMEDOUT {
 					err = nil
 				}
-				// total must be 0 since otherwise we would have returned
-				// above.
 				return 0, nil, err
 			}
 		}

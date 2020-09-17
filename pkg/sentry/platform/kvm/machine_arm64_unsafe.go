@@ -26,6 +26,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/platform"
 	"gvisor.dev/gvisor/pkg/sentry/platform/ring0"
+	"gvisor.dev/gvisor/pkg/sentry/platform/ring0/pagetables"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -46,69 +47,6 @@ func (m *machine) initArchState() error {
 		panic(fmt.Sprintf("error setting KVM_ARM_PREFERRED_TARGET failed: %v", errno))
 	}
 	return nil
-}
-
-func getPageWithReflect(p uintptr) []byte {
-	return (*(*[0xFFFFFF]byte)(unsafe.Pointer(p & ^uintptr(syscall.Getpagesize()-1))))[:syscall.Getpagesize()]
-}
-
-// Work around: move ring0.Vectors() into a specific address with 11-bits alignment.
-//
-// According to the design documentation of Arm64,
-// the start address of exception vector table should be 11-bits aligned.
-// Please see the code in linux kernel as reference: arch/arm64/kernel/entry.S
-// But, we can't align a function's start address to a specific address by using golang.
-// We have raised this question in golang community:
-// https://groups.google.com/forum/m/#!topic/golang-dev/RPj90l5x86I
-// This function will be removed when golang supports this feature.
-//
-// There are 2 jobs were implemented in this function:
-// 1, move the start address of exception vector table into the specific address.
-// 2, modify the offset of each instruction.
-func updateVectorTable() {
-	fromLocation := reflect.ValueOf(ring0.Vectors).Pointer()
-	offset := fromLocation & (1<<11 - 1)
-	if offset != 0 {
-		offset = 1<<11 - offset
-	}
-
-	toLocation := fromLocation + offset
-	page := getPageWithReflect(toLocation)
-	if err := syscall.Mprotect(page, syscall.PROT_READ|syscall.PROT_WRITE|syscall.PROT_EXEC); err != nil {
-		panic(err)
-	}
-
-	page = getPageWithReflect(toLocation + 4096)
-	if err := syscall.Mprotect(page, syscall.PROT_READ|syscall.PROT_WRITE|syscall.PROT_EXEC); err != nil {
-		panic(err)
-	}
-
-	// Move exception-vector-table into the specific address.
-	var entry *uint32
-	var entryFrom *uint32
-	for i := 1; i <= 0x800; i++ {
-		entry = (*uint32)(unsafe.Pointer(toLocation + 0x800 - uintptr(i)))
-		entryFrom = (*uint32)(unsafe.Pointer(fromLocation + 0x800 - uintptr(i)))
-		*entry = *entryFrom
-	}
-
-	// The offset from the address of each unconditionally branch is changed.
-	// We should modify the offset of each instruction.
-	nums := []uint32{0x0, 0x80, 0x100, 0x180, 0x200, 0x280, 0x300, 0x380, 0x400, 0x480, 0x500, 0x580, 0x600, 0x680, 0x700, 0x780}
-	for _, num := range nums {
-		entry = (*uint32)(unsafe.Pointer(toLocation + uintptr(num)))
-		*entry = *entry - (uint32)(offset/4)
-	}
-
-	page = getPageWithReflect(toLocation)
-	if err := syscall.Mprotect(page, syscall.PROT_READ|syscall.PROT_EXEC); err != nil {
-		panic(err)
-	}
-
-	page = getPageWithReflect(toLocation + 4096)
-	if err := syscall.Mprotect(page, syscall.PROT_READ|syscall.PROT_EXEC); err != nil {
-		panic(err)
-	}
 }
 
 // initArchState initializes architecture-specific state.
@@ -134,26 +72,14 @@ func (c *vCPU) initArchState() error {
 
 	// cpacr_el1
 	reg.id = _KVM_ARM64_REGS_CPACR_EL1
-	data = (_FPEN_NOTRAP << _FPEN_SHIFT)
-	if err := c.setOneRegister(&reg); err != nil {
-		return err
-	}
-
-	// sctlr_el1
-	regGet.id = _KVM_ARM64_REGS_SCTLR_EL1
-	if err := c.getOneRegister(&regGet); err != nil {
-		return err
-	}
-
-	dataGet |= (_SCTLR_M | _SCTLR_C | _SCTLR_I)
-	data = dataGet
-	reg.id = _KVM_ARM64_REGS_SCTLR_EL1
+	// It is off by default, and it is turned on only when in use.
+	data = 0 // Disable fpsimd.
 	if err := c.setOneRegister(&reg); err != nil {
 		return err
 	}
 
 	// tcr_el1
-	data = _TCR_TXSZ_VA48 | _TCR_CACHE_FLAGS | _TCR_SHARED | _TCR_TG_FLAGS | _TCR_ASID16 | _TCR_IPS_40BITS
+	data = _TCR_TXSZ_VA48 | _TCR_CACHE_FLAGS | _TCR_SHARED | _TCR_TG_FLAGS | _TCR_ASID16 | _TCR_IPS_40BITS | _TCR_A1
 	reg.id = _KVM_ARM64_REGS_TCR_EL1
 	if err := c.setOneRegister(&reg); err != nil {
 		return err
@@ -177,7 +103,7 @@ func (c *vCPU) initArchState() error {
 	c.SetTtbr0Kvm(uintptr(data))
 
 	// ttbr1_el1
-	data = c.machine.kernel.PageTables.TTBR1_EL1(false, 0)
+	data = c.machine.kernel.PageTables.TTBR1_EL1(false, 1)
 
 	reg.id = _KVM_ARM64_REGS_TTBR1_EL1
 	if err := c.setOneRegister(&reg); err != nil {
@@ -220,12 +146,19 @@ func (c *vCPU) initArchState() error {
 		return err
 	}
 
-	data = ring0.PsrDefaultSet | ring0.KernelFlagsSet
-	reg.id = _KVM_ARM64_REGS_PSTATE
-	if err := c.setOneRegister(&reg); err != nil {
-		return err
+	// Use the address of the exception vector table as
+	// the MMIO address base.
+	arm64HypercallMMIOBase = toLocation
+
+	// Initialize the PCID database.
+	if hasGuestPCID {
+		// Note that NewPCIDs may return a nil table here, in which
+		// case we simply don't use PCID support (see below). In
+		// practice, this should not happen, however.
+		c.PCIDs = pagetables.NewPCIDs(fixedKernelPCID+1, poolPCIDs)
 	}
 
+	c.floatingPointState = arch.NewFloatingPointData()
 	return nil
 }
 
@@ -268,6 +201,32 @@ func (c *vCPU) setSystemTime() error {
 	return nil
 }
 
+// setSignalMask sets the vCPU signal mask.
+//
+// This must be called prior to running the vCPU.
+func (c *vCPU) setSignalMask() error {
+	// The layout of this structure implies that it will not necessarily be
+	// the same layout chosen by the Go compiler. It gets fudged here.
+	var data struct {
+		length uint32
+		mask1  uint32
+		mask2  uint32
+		_      uint32
+	}
+	data.length = 8 // Fixed sigset size.
+	data.mask1 = ^uint32(bounceSignalMask & 0xffffffff)
+	data.mask2 = ^uint32(bounceSignalMask >> 32)
+	if _, _, errno := syscall.RawSyscall(
+		syscall.SYS_IOCTL,
+		uintptr(c.fd),
+		_KVM_SET_SIGNAL_MASK,
+		uintptr(unsafe.Pointer(&data))); errno != 0 {
+		return fmt.Errorf("error setting signal mask: %v", errno)
+	}
+
+	return nil
+}
+
 // SwitchToUser unpacks architectural-details.
 func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo) (usermem.AccessType, error) {
 	// Check for canonical addresses.
@@ -275,6 +234,13 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo) 
 		return nonCanonical(regs.Pc, int32(syscall.SIGSEGV), info)
 	} else if !ring0.IsCanonical(regs.Sp) {
 		return nonCanonical(regs.Sp, int32(syscall.SIGBUS), info)
+	}
+
+	// Assign PCIDs.
+	if c.PCIDs != nil {
+		var requireFlushPCID bool // Force a flush?
+		switchOpts.UserASID, requireFlushPCID = c.PCIDs.Assign(switchOpts.PageTables)
+		switchOpts.Flush = switchOpts.Flush || requireFlushPCID
 	}
 
 	var vector ring0.Vector
@@ -303,10 +269,18 @@ func (c *vCPU) SwitchToUser(switchOpts ring0.SwitchOpts, info *arch.SignalInfo) 
 
 	case ring0.PageFault:
 		return c.fault(int32(syscall.SIGSEGV), info)
-	case 0xaa:
-		return usermem.NoAccess, nil
+	case ring0.Vector(bounce): // ring0.VirtualizationException
+		return usermem.NoAccess, platform.ErrContextInterrupt
+	case ring0.El0Sync_undef,
+		ring0.El1Sync_undef:
+		*info = arch.SignalInfo{
+			Signo: int32(syscall.SIGILL),
+			Code:  1, // ILL_ILLOPC (illegal opcode).
+		}
+		info.SetAddr(switchOpts.Registers.Pc) // Include address.
+		return usermem.AccessType{}, platform.ErrContextSignal
 	default:
-		return usermem.NoAccess, platform.ErrContextSignal
+		panic(fmt.Sprintf("unexpected vector: 0x%x", vector))
 	}
 
 }

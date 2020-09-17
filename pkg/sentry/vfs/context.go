@@ -40,6 +40,30 @@ func MountNamespaceFromContext(ctx context.Context) *MountNamespace {
 	return nil
 }
 
+type mountNamespaceContext struct {
+	context.Context
+	mntns *MountNamespace
+}
+
+// Value implements Context.Value.
+func (mc mountNamespaceContext) Value(key interface{}) interface{} {
+	switch key {
+	case CtxMountNamespace:
+		mc.mntns.IncRef()
+		return mc.mntns
+	default:
+		return mc.Context.Value(key)
+	}
+}
+
+// WithMountNamespace returns a copy of ctx with the given MountNamespace.
+func WithMountNamespace(ctx context.Context, mntns *MountNamespace) context.Context {
+	return &mountNamespaceContext{
+		Context: ctx,
+		mntns:   mntns,
+	}
+}
+
 // RootFromContext returns the VFS root used by ctx. It takes a reference on
 // the returned VirtualDentry. If ctx does not have a specific VFS root,
 // RootFromContext returns a zero-value VirtualDentry.
@@ -48,4 +72,28 @@ func RootFromContext(ctx context.Context) VirtualDentry {
 		return v.(VirtualDentry)
 	}
 	return VirtualDentry{}
+}
+
+type rootContext struct {
+	context.Context
+	root VirtualDentry
+}
+
+// WithRoot returns a copy of ctx with the given root.
+func WithRoot(ctx context.Context, root VirtualDentry) context.Context {
+	return &rootContext{
+		Context: ctx,
+		root:    root,
+	}
+}
+
+// Value implements Context.Value.
+func (rc rootContext) Value(key interface{}) interface{} {
+	switch key {
+	case CtxRoot:
+		rc.root.IncRef()
+		return rc.root
+	default:
+		return rc.Context.Value(key)
+	}
 }

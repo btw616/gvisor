@@ -23,6 +23,8 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
 )
 
+// LINT.IfChange
+
 type scmRights struct {
 	fds []int
 }
@@ -32,8 +34,6 @@ func newSCMRights(fds []int) control.SCMRights {
 }
 
 // Files implements control.SCMRights.Files.
-//
-// TODO(gvisor.dev/issue/2017): Port to VFS2.
 func (c *scmRights) Files(ctx context.Context, max int) (control.RightsFiles, bool) {
 	n := max
 	var trunc bool
@@ -57,7 +57,7 @@ func (c *scmRights) Clone() transport.RightsControlMessage {
 }
 
 // Release implements transport.RightsControlMessage.Release.
-func (c *scmRights) Release() {
+func (c *scmRights) Release(ctx context.Context) {
 	for _, fd := range c.fds {
 		syscall.Close(fd)
 	}
@@ -93,3 +93,5 @@ func fdsToFiles(ctx context.Context, fds []int) []*fs.File {
 	}
 	return files
 }
+
+// LINT.ThenChange(../../fsimpl/host/control.go)

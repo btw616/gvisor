@@ -22,7 +22,6 @@ import (
 	"io/ioutil"
 	"os"
 	"os/exec"
-	"os/signal"
 	"regexp"
 	"strconv"
 	"strings"
@@ -31,10 +30,14 @@ import (
 
 	"github.com/cenkalti/backoff"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
+	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/sentry/control"
+	"gvisor.dev/gvisor/pkg/sentry/sighandling"
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/cgroup"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/sandbox"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
@@ -267,14 +270,14 @@ type Args struct {
 // New creates the container in a new Sandbox process, unless the metadata
 // indicates that an existing Sandbox should be used. The caller must call
 // Destroy() on the container.
-func New(conf *boot.Config, args Args) (*Container, error) {
+func New(conf *config.Config, args Args) (*Container, error) {
 	log.Debugf("Create container %q in root dir: %s", args.ID, conf.RootDir)
 	if err := validateID(args.ID); err != nil {
 		return nil, err
 	}
 
 	if err := os.MkdirAll(conf.RootDir, 0711); err != nil {
-		return nil, fmt.Errorf("creating container root directory: %v", err)
+		return nil, fmt.Errorf("creating container root directory %q: %v", conf.RootDir, err)
 	}
 
 	c := &Container{
@@ -292,7 +295,7 @@ func New(conf *boot.Config, args Args) (*Container, error) {
 	}
 	// The Cleanup object cleans up partially created containers when an error
 	// occurs. Any errors occurring during cleanup itself are ignored.
-	cu := specutils.MakeCleanup(func() { _ = c.Destroy() })
+	cu := cleanup.Make(func() { _ = c.Destroy() })
 	defer cu.Clean()
 
 	// Lock the container metadata file to prevent concurrent creations of
@@ -322,7 +325,7 @@ func New(conf *boot.Config, args Args) (*Container, error) {
 			}
 		}
 		if err := runInCgroup(cg, func() error {
-			ioFiles, specFile, err := c.createGoferProcess(args.Spec, conf, args.BundleDir)
+			ioFiles, specFile, err := c.createGoferProcess(args.Spec, conf, args.BundleDir, args.Attached)
 			if err != nil {
 				return err
 			}
@@ -395,13 +398,13 @@ func New(conf *boot.Config, args Args) (*Container, error) {
 }
 
 // Start starts running the containerized process inside the sandbox.
-func (c *Container) Start(conf *boot.Config) error {
+func (c *Container) Start(conf *config.Config) error {
 	log.Debugf("Start container %q", c.ID)
 
 	if err := c.Saver.lock(); err != nil {
 		return err
 	}
-	unlock := specutils.MakeCleanup(func() { c.Saver.unlock() })
+	unlock := cleanup.Make(func() { c.Saver.unlock() })
 	defer unlock.Clean()
 
 	if err := c.requireStatus("start", Created); err != nil {
@@ -421,11 +424,11 @@ func (c *Container) Start(conf *boot.Config) error {
 			return err
 		}
 	} else {
-		// Join cgroup to strt gofer process to ensure it's part of the cgroup from
+		// Join cgroup to start gofer process to ensure it's part of the cgroup from
 		// the start (and all their children processes).
 		if err := runInCgroup(c.Sandbox.Cgroup, func() error {
 			// Create the gofer process.
-			ioFiles, mountsFile, err := c.createGoferProcess(c.Spec, conf, c.BundleDir)
+			ioFiles, mountsFile, err := c.createGoferProcess(c.Spec, conf, c.BundleDir, false)
 			if err != nil {
 				return err
 			}
@@ -470,7 +473,7 @@ func (c *Container) Start(conf *boot.Config) error {
 
 // Restore takes a container and replaces its kernel and file system
 // to restore a container from its state file.
-func (c *Container) Restore(spec *specs.Spec, conf *boot.Config, restoreFile string) error {
+func (c *Container) Restore(spec *specs.Spec, conf *config.Config, restoreFile string) error {
 	log.Debugf("Restore container %q", c.ID)
 	if err := c.Saver.lock(); err != nil {
 		return err
@@ -497,7 +500,7 @@ func (c *Container) Restore(spec *specs.Spec, conf *boot.Config, restoreFile str
 }
 
 // Run is a helper that calls Create + Start + Wait.
-func Run(conf *boot.Config, args Args) (syscall.WaitStatus, error) {
+func Run(conf *config.Config, args Args) (syscall.WaitStatus, error) {
 	log.Debugf("Run container %q in root dir: %s", args.ID, conf.RootDir)
 	c, err := New(conf, args)
 	if err != nil {
@@ -505,7 +508,7 @@ func Run(conf *boot.Config, args Args) (syscall.WaitStatus, error) {
 	}
 	// Clean up partially created container if an error occurs.
 	// Any errors returned by Destroy() itself are ignored.
-	cu := specutils.MakeCleanup(func() {
+	cu := cleanup.Make(func() {
 		c.Destroy()
 	})
 	defer cu.Clean()
@@ -621,21 +624,15 @@ func (c *Container) SignalProcess(sig syscall.Signal, pid int32) error {
 // forwarding signals.
 func (c *Container) ForwardSignals(pid int32, fgProcess bool) func() {
 	log.Debugf("Forwarding all signals to container %q PID %d fgProcess=%t", c.ID, pid, fgProcess)
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh)
-	go func() {
-		for s := range sigCh {
-			log.Debugf("Forwarding signal %d to container %q PID %d fgProcess=%t", s, c.ID, pid, fgProcess)
-			if err := c.Sandbox.SignalProcess(c.ID, pid, s.(syscall.Signal), fgProcess); err != nil {
-				log.Warningf("error forwarding signal %d to container %q: %v", s, c.ID, err)
-			}
+	stop := sighandling.StartSignalForwarding(func(sig linux.Signal) {
+		log.Debugf("Forwarding signal %d to container %q PID %d fgProcess=%t", sig, c.ID, pid, fgProcess)
+		if err := c.Sandbox.SignalProcess(c.ID, pid, syscall.Signal(sig), fgProcess); err != nil {
+			log.Warningf("error forwarding signal %d to container %q: %v", sig, c.ID, err)
 		}
-		log.Debugf("Done forwarding signals to container %q PID %d fgProcess=%t", c.ID, pid, fgProcess)
-	}()
-
+	})
 	return func() {
-		signal.Stop(sigCh)
-		close(sigCh)
+		log.Debugf("Done forwarding signals to container %q PID %d fgProcess=%t", c.ID, pid, fgProcess)
+		stop()
 	}
 }
 
@@ -865,7 +862,7 @@ func (c *Container) waitForStopped() error {
 	return backoff.Retry(op, b)
 }
 
-func (c *Container) createGoferProcess(spec *specs.Spec, conf *boot.Config, bundleDir string) ([]*os.File, *os.File, error) {
+func (c *Container) createGoferProcess(spec *specs.Spec, conf *config.Config, bundleDir string, attached bool) ([]*os.File, *os.File, error) {
 	// Start with the general config flags.
 	args := conf.ToFlags()
 
@@ -958,6 +955,14 @@ func (c *Container) createGoferProcess(spec *specs.Spec, conf *boot.Config, bund
 	cmd := exec.Command(binPath, args...)
 	cmd.ExtraFiles = goferEnds
 	cmd.Args[0] = "runsc-gofer"
+
+	if attached {
+		// The gofer is attached to the lifetime of this process, so it
+		// should synchronously die when this process dies.
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Pdeathsig: syscall.SIGKILL,
+		}
+	}
 
 	// Enter new namespaces to isolate from the rest of the system. Don't unshare
 	// cgroup because gofer is added to a cgroup in the caller's namespace.
@@ -1077,9 +1082,9 @@ func (c *Container) adjustGoferOOMScoreAdj() error {
 // oom_score_adj is set to the lowest oom_score_adj among the containers
 // running in the sandbox.
 //
-// TODO(gvisor.dev/issue/512): This call could race with other containers being
+// TODO(gvisor.dev/issue/238): This call could race with other containers being
 // created at the same time and end up setting the wrong oom_score_adj to the
-// sandbox.
+// sandbox. Use rpc client to synchronize.
 func adjustSandboxOOMScoreAdj(s *sandbox.Sandbox, rootDir string, destroy bool) error {
 	containers, err := loadSandbox(rootDir, s.ID)
 	if err != nil {

@@ -49,7 +49,7 @@ type TaskContext struct {
 	fu *futex.Manager
 
 	// st is the task's syscall table.
-	st *SyscallTable
+	st *SyscallTable `state:".(syscallTableInfo)"`
 }
 
 // release releases all resources held by the TaskContext. release is called by
@@ -58,7 +58,6 @@ func (tc *TaskContext) release() {
 	// Nil out pointers so that if the task is saved after release, it doesn't
 	// follow the pointers to possibly now-invalid objects.
 	if tc.MemoryManager != nil {
-		// TODO(b/38173783)
 		tc.MemoryManager.DecUsers(context.Background())
 		tc.MemoryManager = nil
 	}

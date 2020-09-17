@@ -152,7 +152,7 @@ func NewConnectedPipe(ctx context.Context, sizeBytes, atomicIOBytes int64) (*fs.
 	d := fs.NewDirent(ctx, fs.NewInode(ctx, iops, ms, sattr), fmt.Sprintf("pipe:[%d]", ino))
 	// The p.Open calls below will each take a reference on the Dirent. We
 	// must drop the one we already have.
-	defer d.DecRef()
+	defer d.DecRef(ctx)
 	return p.Open(ctx, d, fs.FileFlags{Read: true}), p.Open(ctx, d, fs.FileFlags{Write: true})
 }
 
@@ -200,13 +200,16 @@ type readOps struct {
 //
 // Precondition: this pipe must have readers.
 func (p *Pipe) read(ctx context.Context, ops readOps) (int64, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.readLocked(ctx, ops)
+}
+
+func (p *Pipe) readLocked(ctx context.Context, ops readOps) (int64, error) {
 	// Don't block for a zero-length read even if the pipe is empty.
 	if ops.left() == 0 {
 		return 0, nil
 	}
-
-	p.mu.Lock()
-	defer p.mu.Unlock()
 
 	// Is the pipe empty?
 	if p.view.Size() == 0 {
@@ -246,7 +249,10 @@ type writeOps struct {
 func (p *Pipe) write(ctx context.Context, ops writeOps) (int64, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.writeLocked(ctx, ops)
+}
 
+func (p *Pipe) writeLocked(ctx context.Context, ops writeOps) (int64, error) {
 	// Can't write to a pipe with no readers.
 	if !p.HasReaders() {
 		return 0, syscall.EPIPE
@@ -255,7 +261,8 @@ func (p *Pipe) write(ctx context.Context, ops writeOps) (int64, error) {
 	// POSIX requires that a write smaller than atomicIOBytes (PIPE_BUF) be
 	// atomic, but requires no atomicity for writes larger than this.
 	wanted := ops.left()
-	if avail := p.max - p.view.Size(); wanted > avail {
+	avail := p.max - p.view.Size()
+	if wanted > avail {
 		if wanted <= p.atomicIOBytes {
 			return 0, syserror.ErrWouldBlock
 		}
@@ -268,8 +275,14 @@ func (p *Pipe) write(ctx context.Context, ops writeOps) (int64, error) {
 		return done, err
 	}
 
-	if wanted > done {
-		// Partial write due to full pipe.
+	if done < avail {
+		// Non-failure, but short write.
+		return done, nil
+	}
+	if done < wanted {
+		// Partial write due to full pipe. Note that this could also be
+		// the short write case above, we would expect a second call
+		// and the write to return zero bytes in this case.
 		return done, syserror.ErrWouldBlock
 	}
 
@@ -375,6 +388,10 @@ func (p *Pipe) rwReadiness() waiter.EventMask {
 func (p *Pipe) queued() int64 {
 	p.mu.Lock()
 	defer p.mu.Unlock()
+	return p.queuedLocked()
+}
+
+func (p *Pipe) queuedLocked() int64 {
 	return p.view.Size()
 }
 

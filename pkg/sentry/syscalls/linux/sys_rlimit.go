@@ -16,6 +16,7 @@ package linux
 
 import (
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/kernel"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
@@ -26,17 +27,13 @@ import (
 // rlimit describes an implementation of 'struct rlimit', which may vary from
 // system-to-system.
 type rlimit interface {
+	marshal.Marshallable
+
 	// toLimit converts an rlimit to a limits.Limit.
 	toLimit() *limits.Limit
 
 	// fromLimit converts a limits.Limit to an rlimit.
 	fromLimit(lim limits.Limit)
-
-	// copyIn copies an rlimit from the untrusted app to the kernel.
-	copyIn(t *kernel.Task, addr usermem.Addr) error
-
-	// copyOut copies an rlimit from the kernel to the untrusted app.
-	copyOut(t *kernel.Task, addr usermem.Addr) error
 }
 
 // newRlimit returns the appropriate rlimit type for 'struct rlimit' on this system.
@@ -50,6 +47,7 @@ func newRlimit(t *kernel.Task) (rlimit, error) {
 	}
 }
 
+// +marshal
 type rlimit64 struct {
 	Cur uint64
 	Max uint64
@@ -70,12 +68,12 @@ func (r *rlimit64) fromLimit(lim limits.Limit) {
 }
 
 func (r *rlimit64) copyIn(t *kernel.Task, addr usermem.Addr) error {
-	_, err := t.CopyIn(addr, r)
+	_, err := r.CopyIn(t, addr)
 	return err
 }
 
 func (r *rlimit64) copyOut(t *kernel.Task, addr usermem.Addr) error {
-	_, err := t.CopyOut(addr, *r)
+	_, err := r.CopyOut(t, addr)
 	return err
 }
 
@@ -140,7 +138,8 @@ func Getrlimit(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sys
 		return 0, nil, err
 	}
 	rlim.fromLimit(lim)
-	return 0, nil, rlim.copyOut(t, addr)
+	_, err = rlim.CopyOut(t, addr)
+	return 0, nil, err
 }
 
 // Setrlimit implements linux syscall setrlimit(2).
@@ -155,7 +154,7 @@ func Setrlimit(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sys
 	if err != nil {
 		return 0, nil, err
 	}
-	if err := rlim.copyIn(t, addr); err != nil {
+	if _, err := rlim.CopyIn(t, addr); err != nil {
 		return 0, nil, syserror.EFAULT
 	}
 	_, err = prlimit64(t, resource, rlim.toLimit())
@@ -197,7 +196,7 @@ func Prlimit64(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sys
 	// saved set user IDs of the target process must match the real user ID of
 	// the caller and the real, effective, and saved set group IDs of the
 	// target process must match the real group ID of the caller."
-	if !t.HasCapabilityIn(linux.CAP_SYS_RESOURCE, t.PIDNamespace().UserNamespace()) {
+	if ot != t && !t.HasCapabilityIn(linux.CAP_SYS_RESOURCE, t.PIDNamespace().UserNamespace()) {
 		cred, tcred := t.Credentials(), ot.Credentials()
 		if cred.RealKUID != tcred.RealKUID ||
 			cred.RealKUID != tcred.EffectiveKUID ||

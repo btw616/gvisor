@@ -23,12 +23,13 @@ import (
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
 // PacketInfo holds all the information about an outbound packet.
 type PacketInfo struct {
-	Pkt   stack.PacketBuffer
+	Pkt   *stack.PacketBuffer
 	Proto tcpip.NetworkProtocolNumber
 	GSO   *stack.GSO
 	Route stack.Route
@@ -50,13 +51,11 @@ type NotificationHandle struct {
 }
 
 type queue struct {
+	// c is the outbound packet channel.
+	c chan PacketInfo
 	// mu protects fields below.
-	mu sync.RWMutex
-	// c is the outbound packet channel. Sending to c should hold mu.
-	c        chan PacketInfo
-	numWrite int
-	numRead  int
-	notify   []*NotificationHandle
+	mu     sync.RWMutex
+	notify []*NotificationHandle
 }
 
 func (q *queue) Close() {
@@ -64,11 +63,8 @@ func (q *queue) Close() {
 }
 
 func (q *queue) Read() (PacketInfo, bool) {
-	q.mu.Lock()
-	defer q.mu.Unlock()
 	select {
 	case p := <-q.c:
-		q.numRead++
 		return p, true
 	default:
 		return PacketInfo{}, false
@@ -76,15 +72,8 @@ func (q *queue) Read() (PacketInfo, bool) {
 }
 
 func (q *queue) ReadContext(ctx context.Context) (PacketInfo, bool) {
-	// We have to receive from channel without holding the lock, since it can
-	// block indefinitely. This will cause a window that numWrite - numRead
-	// produces a larger number, but won't go to negative. numWrite >= numRead
-	// still holds.
 	select {
 	case pkt := <-q.c:
-		q.mu.Lock()
-		defer q.mu.Unlock()
-		q.numRead++
 		return pkt, true
 	case <-ctx.Done():
 		return PacketInfo{}, false
@@ -93,16 +82,12 @@ func (q *queue) ReadContext(ctx context.Context) (PacketInfo, bool) {
 
 func (q *queue) Write(p PacketInfo) bool {
 	wrote := false
-
-	// It's important to make sure nobody can see numWrite until we increment it,
-	// so numWrite >= numRead holds.
-	q.mu.Lock()
 	select {
 	case q.c <- p:
 		wrote = true
-		q.numWrite++
 	default:
 	}
+	q.mu.Lock()
 	notify := q.notify
 	q.mu.Unlock()
 
@@ -116,13 +101,7 @@ func (q *queue) Write(p PacketInfo) bool {
 }
 
 func (q *queue) Num() int {
-	q.mu.RLock()
-	defer q.mu.RUnlock()
-	n := q.numWrite - q.numRead
-	if n < 0 {
-		panic("numWrite < numRead")
-	}
-	return n
+	return len(q.c)
 }
 
 func (q *queue) AddNotify(notify Notification) *NotificationHandle {
@@ -203,13 +182,13 @@ func (e *Endpoint) NumQueued() int {
 }
 
 // InjectInbound injects an inbound packet.
-func (e *Endpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBuffer) {
+func (e *Endpoint) InjectInbound(protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
 	e.InjectLinkAddr(protocol, "", pkt)
 }
 
 // InjectLinkAddr injects an inbound packet with a remote link address.
-func (e *Endpoint) InjectLinkAddr(protocol tcpip.NetworkProtocolNumber, remote tcpip.LinkAddress, pkt stack.PacketBuffer) {
-	e.dispatcher.DeliverNetworkPacket(e, remote, "" /* local */, protocol, pkt)
+func (e *Endpoint) InjectLinkAddr(protocol tcpip.NetworkProtocolNumber, remote tcpip.LinkAddress, pkt *stack.PacketBuffer) {
+	e.dispatcher.DeliverNetworkPacket(remote, "" /* local */, protocol, pkt)
 }
 
 // Attach saves the stack network-layer dispatcher for use later when packets
@@ -251,7 +230,7 @@ func (e *Endpoint) LinkAddress() tcpip.LinkAddress {
 }
 
 // WritePacket stores outbound packets into the channel.
-func (e *Endpoint) WritePacket(r *stack.Route, gso *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt stack.PacketBuffer) *tcpip.Error {
+func (e *Endpoint) WritePacket(r *stack.Route, gso *stack.GSO, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) *tcpip.Error {
 	// Clone r then release its resource so we only get the relevant fields from
 	// stack.Route without holding a reference to a NIC's endpoint.
 	route := r.Clone()
@@ -269,21 +248,15 @@ func (e *Endpoint) WritePacket(r *stack.Route, gso *stack.GSO, protocol tcpip.Ne
 }
 
 // WritePackets stores outbound packets into the channel.
-func (e *Endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts []stack.PacketBuffer, protocol tcpip.NetworkProtocolNumber) (int, *tcpip.Error) {
+func (e *Endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, *tcpip.Error) {
 	// Clone r then release its resource so we only get the relevant fields from
 	// stack.Route without holding a reference to a NIC's endpoint.
 	route := r.Clone()
 	route.Release()
-	payloadView := pkts[0].Data.ToView()
 	n := 0
-	for _, pkt := range pkts {
-		off := pkt.DataOffset
-		size := pkt.DataSize
+	for pkt := pkts.Front(); pkt != nil; pkt = pkt.Next() {
 		p := PacketInfo{
-			Pkt: stack.PacketBuffer{
-				Header: pkt.Header,
-				Data:   buffer.NewViewFromBytes(payloadView[off : off+size]).ToVectorisedView(),
-			},
+			Pkt:   pkt,
 			Proto: protocol,
 			GSO:   gso,
 			Route: route,
@@ -301,7 +274,9 @@ func (e *Endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts []stack.Pac
 // WriteRawPacket implements stack.LinkEndpoint.WriteRawPacket.
 func (e *Endpoint) WriteRawPacket(vv buffer.VectorisedView) *tcpip.Error {
 	p := PacketInfo{
-		Pkt:   stack.PacketBuffer{Data: vv},
+		Pkt: stack.NewPacketBuffer(stack.PacketBufferOptions{
+			Data: vv,
+		}),
 		Proto: 0,
 		GSO:   nil,
 	}
@@ -323,4 +298,13 @@ func (e *Endpoint) AddNotify(notify Notification) *NotificationHandle {
 // RemoveNotify removes handle from the list of notification targets.
 func (e *Endpoint) RemoveNotify(handle *NotificationHandle) {
 	e.q.RemoveNotify(handle)
+}
+
+// ARPHardwareType implements stack.LinkEndpoint.ARPHardwareType.
+func (*Endpoint) ARPHardwareType() header.ARPHardwareType {
+	return header.ARPHardwareNone
+}
+
+// AddHeader implements stack.LinkEndpoint.AddHeader.
+func (e *Endpoint) AddHeader(local, remote tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt *stack.PacketBuffer) {
 }

@@ -48,6 +48,8 @@ func ExtractErrno(err error) syscall.Errno {
 		return ExtractErrno(e.Err)
 	case *os.SyscallError:
 		return ExtractErrno(e.Err)
+	case *os.LinkError:
+		return ExtractErrno(e.Err)
 	}
 
 	// Default case.
@@ -119,6 +121,37 @@ func (t *Tclunk) handle(cs *connState) message {
 		return newErr(syscall.EBADF)
 	}
 	return &Rclunk{}
+}
+
+func (t *Tsetattrclunk) handle(cs *connState) message {
+	ref, ok := cs.LookupFID(t.FID)
+	if !ok {
+		return newErr(syscall.EBADF)
+	}
+	defer ref.DecRef()
+
+	setAttrErr := ref.safelyWrite(func() error {
+		// We don't allow setattr on files that have been deleted.
+		// This might be technically incorrect, as it's possible that
+		// there were multiple links and you can still change the
+		// corresponding inode information.
+		if ref.isDeleted() {
+			return syscall.EINVAL
+		}
+
+		// Set the attributes.
+		return ref.file.SetAttr(t.Valid, t.SetAttr)
+	})
+
+	// Try to delete FID even in case of failure above. Since the state of the
+	// file is unknown to the caller, it will not attempt to close the file again.
+	if !cs.DeleteFID(t.FID) {
+		return newErr(syscall.EBADF)
+	}
+	if setAttrErr != nil {
+		return newErr(setAttrErr)
+	}
+	return &Rsetattrclunk{}
 }
 
 // handle implements handler.handle.
@@ -920,8 +953,15 @@ func (t *Tgetxattr) handle(cs *connState) message {
 	}
 	defer ref.DecRef()
 
-	val, err := ref.file.GetXattr(t.Name, t.Size)
-	if err != nil {
+	var val string
+	if err := ref.safelyRead(func() (err error) {
+		// Don't allow getxattr on files that have been deleted.
+		if ref.isDeleted() {
+			return syscall.EINVAL
+		}
+		val, err = ref.file.GetXattr(t.Name, t.Size)
+		return err
+	}); err != nil {
 		return newErr(err)
 	}
 	return &Rgetxattr{Value: val}
@@ -935,7 +975,13 @@ func (t *Tsetxattr) handle(cs *connState) message {
 	}
 	defer ref.DecRef()
 
-	if err := ref.file.SetXattr(t.Name, t.Value, t.Flags); err != nil {
+	if err := ref.safelyWrite(func() error {
+		// Don't allow setxattr on files that have been deleted.
+		if ref.isDeleted() {
+			return syscall.EINVAL
+		}
+		return ref.file.SetXattr(t.Name, t.Value, t.Flags)
+	}); err != nil {
 		return newErr(err)
 	}
 	return &Rsetxattr{}
@@ -949,10 +995,18 @@ func (t *Tlistxattr) handle(cs *connState) message {
 	}
 	defer ref.DecRef()
 
-	xattrs, err := ref.file.ListXattr(t.Size)
-	if err != nil {
+	var xattrs map[string]struct{}
+	if err := ref.safelyRead(func() (err error) {
+		// Don't allow listxattr on files that have been deleted.
+		if ref.isDeleted() {
+			return syscall.EINVAL
+		}
+		xattrs, err = ref.file.ListXattr(t.Size)
+		return err
+	}); err != nil {
 		return newErr(err)
 	}
+
 	xattrList := make([]string, 0, len(xattrs))
 	for x := range xattrs {
 		xattrList = append(xattrList, x)
@@ -968,7 +1022,13 @@ func (t *Tremovexattr) handle(cs *connState) message {
 	}
 	defer ref.DecRef()
 
-	if err := ref.file.RemoveXattr(t.Name); err != nil {
+	if err := ref.safelyWrite(func() error {
+		// Don't allow removexattr on files that have been deleted.
+		if ref.isDeleted() {
+			return syscall.EINVAL
+		}
+		return ref.file.RemoveXattr(t.Name)
+	}); err != nil {
 		return newErr(err)
 	}
 	return &Rremovexattr{}

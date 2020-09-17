@@ -15,7 +15,11 @@
 package vfs
 
 import (
+	"bytes"
+	"fmt"
 	"math"
+	"sort"
+	"strings"
 	"sync/atomic"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
@@ -23,9 +27,6 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/kernel/auth"
 	"gvisor.dev/gvisor/pkg/syserror"
 )
-
-// lastMountID is used to allocate mount ids. Must be accessed atomically.
-var lastMountID uint64
 
 // A Mount is a replacement of a Dentry (Mount.key.point) from one Filesystem
 // (Mount.key.parent.fs) with a Dentry (Mount.root) from another Filesystem
@@ -44,7 +45,7 @@ var lastMountID uint64
 //
 // +stateify savable
 type Mount struct {
-	// vfs, fs, and root are immutable. References are held on fs and root.
+	// vfs, fs, root are immutable. References are held on fs and root.
 	//
 	// Invariant: root belongs to fs.
 	vfs  *VirtualFilesystem
@@ -53,6 +54,10 @@ type Mount struct {
 
 	// ID is the immutable mount ID.
 	ID uint64
+
+	// Flags contains settings as specified for mount(2), e.g. MS_NOEXEC, except
+	// for MS_RDONLY which is tracked in "writers". Immutable.
+	Flags MountFlags
 
 	// key is protected by VirtualFilesystem.mountMu and
 	// VirtualFilesystem.mounts.seq, and may be nil. References are held on
@@ -80,10 +85,6 @@ type Mount struct {
 	// umounted is true. umounted is protected by VirtualFilesystem.mountMu.
 	umounted bool
 
-	// flags contains settings as specified for mount(2), e.g. MS_NOEXEC, except
-	// for MS_RDONLY which is tracked in "writers".
-	flags MountFlags
-
 	// The lower 63 bits of writers is the number of calls to
 	// Mount.CheckBeginWrite() that have not yet been paired with a call to
 	// Mount.EndWrite(). The MSB of writers is set if MS_RDONLY is in effect.
@@ -93,11 +94,11 @@ type Mount struct {
 
 func newMount(vfs *VirtualFilesystem, fs *Filesystem, root *Dentry, mntns *MountNamespace, opts *MountOptions) *Mount {
 	mnt := &Mount{
-		ID:    atomic.AddUint64(&lastMountID, 1),
+		ID:    atomic.AddUint64(&vfs.lastMountID, 1),
+		Flags: opts.Flags,
 		vfs:   vfs,
 		fs:    fs,
 		root:  root,
-		flags: opts.Flags,
 		ns:    mntns,
 		refs:  1,
 	}
@@ -107,8 +108,17 @@ func newMount(vfs *VirtualFilesystem, fs *Filesystem, root *Dentry, mntns *Mount
 	return mnt
 }
 
-// A MountNamespace is a collection of Mounts.
-//
+// Options returns a copy of the MountOptions currently applicable to mnt.
+func (mnt *Mount) Options() MountOptions {
+	mnt.vfs.mountMu.Lock()
+	defer mnt.vfs.mountMu.Unlock()
+	return MountOptions{
+		Flags:    mnt.Flags,
+		ReadOnly: mnt.ReadOnly(),
+	}
+}
+
+// A MountNamespace is a collection of Mounts.//
 // MountNamespaces are reference-counted. Unless otherwise specified, all
 // MountNamespace methods require that a reference is held.
 //
@@ -116,12 +126,13 @@ func newMount(vfs *VirtualFilesystem, fs *Filesystem, root *Dentry, mntns *Mount
 //
 // +stateify savable
 type MountNamespace struct {
+	MountNamespaceRefs
+
+	// Owner is the usernamespace that owns this mount namespace.
+	Owner *auth.UserNamespace
+
 	// root is the MountNamespace's root mount. root is immutable.
 	root *Mount
-
-	// refs is the reference count. refs is accessed using atomic memory
-	// operations.
-	refs int64
 
 	// mountpoints maps all Dentries which are mount points in this namespace
 	// to the number of Mounts for which they are mount points. mountpoints is
@@ -141,21 +152,22 @@ type MountNamespace struct {
 // NewMountNamespace returns a new mount namespace with a root filesystem
 // configured by the given arguments. A reference is taken on the returned
 // MountNamespace.
-func (vfs *VirtualFilesystem) NewMountNamespace(ctx context.Context, creds *auth.Credentials, source, fsTypeName string, opts *GetFilesystemOptions) (*MountNamespace, error) {
+func (vfs *VirtualFilesystem) NewMountNamespace(ctx context.Context, creds *auth.Credentials, source, fsTypeName string, opts *MountOptions) (*MountNamespace, error) {
 	rft := vfs.getFilesystemType(fsTypeName)
 	if rft == nil {
-		ctx.Warningf("Unknown filesystem: %s", fsTypeName)
+		ctx.Warningf("Unknown filesystem type: %s", fsTypeName)
 		return nil, syserror.ENODEV
 	}
-	fs, root, err := rft.fsType.GetFilesystem(ctx, vfs, creds, source, *opts)
+	fs, root, err := rft.fsType.GetFilesystem(ctx, vfs, creds, source, opts.GetFilesystemOptions)
 	if err != nil {
 		return nil, err
 	}
 	mntns := &MountNamespace{
-		refs:        1,
+		Owner:       creds.UserNamespace,
 		mountpoints: make(map[*Dentry]uint32),
 	}
-	mntns.root = newMount(vfs, fs, root, mntns, &MountOptions{})
+	mntns.EnableLeakCheck()
+	mntns.root = newMount(vfs, fs, root, mntns, opts)
 	return mntns, nil
 }
 
@@ -171,36 +183,43 @@ func (vfs *VirtualFilesystem) NewDisconnectedMount(fs *Filesystem, root *Dentry,
 	return newMount(vfs, fs, root, nil /* mntns */, opts), nil
 }
 
-// MountAt creates and mounts a Filesystem configured by the given arguments.
-func (vfs *VirtualFilesystem) MountAt(ctx context.Context, creds *auth.Credentials, source string, target *PathOperation, fsTypeName string, opts *MountOptions) error {
+// MountDisconnected creates a Filesystem configured by the given arguments,
+// then returns a Mount representing it. The new Mount is not associated with
+// any MountNamespace and is not connected to any other Mounts.
+func (vfs *VirtualFilesystem) MountDisconnected(ctx context.Context, creds *auth.Credentials, source string, fsTypeName string, opts *MountOptions) (*Mount, error) {
 	rft := vfs.getFilesystemType(fsTypeName)
 	if rft == nil {
-		return syserror.ENODEV
+		return nil, syserror.ENODEV
 	}
 	if !opts.InternalMount && !rft.opts.AllowUserMount {
-		return syserror.ENODEV
+		return nil, syserror.ENODEV
 	}
 	fs, root, err := rft.fsType.GetFilesystem(ctx, vfs, creds, source, opts.GetFilesystemOptions)
 	if err != nil {
-		return err
+		return nil, err
 	}
+	defer root.DecRef(ctx)
+	defer fs.DecRef(ctx)
+	return vfs.NewDisconnectedMount(fs, root, opts)
+}
+
+// ConnectMountAt connects mnt at the path represented by target.
+//
+// Preconditions: mnt must be disconnected.
+func (vfs *VirtualFilesystem) ConnectMountAt(ctx context.Context, creds *auth.Credentials, mnt *Mount, target *PathOperation) error {
 	// We can't hold vfs.mountMu while calling FilesystemImpl methods due to
 	// lock ordering.
 	vd, err := vfs.GetDentryAt(ctx, creds, target, &GetDentryOptions{})
 	if err != nil {
-		root.DecRef()
-		fs.DecRef()
 		return err
 	}
 	vfs.mountMu.Lock()
 	vd.dentry.mu.Lock()
 	for {
-		if vd.dentry.IsDisowned() {
+		if vd.dentry.dead {
 			vd.dentry.mu.Unlock()
 			vfs.mountMu.Unlock()
-			vd.DecRef()
-			root.DecRef()
-			fs.DecRef()
+			vd.DecRef(ctx)
 			return syserror.ENOENT
 		}
 		// vd might have been mounted over between vfs.GetDentryAt() and
@@ -222,24 +241,40 @@ func (vfs *VirtualFilesystem) MountAt(ctx context.Context, creds *auth.Credentia
 		// This can't fail since we're holding vfs.mountMu.
 		nextmnt.root.IncRef()
 		vd.dentry.mu.Unlock()
-		vd.DecRef()
+		vd.DecRef(ctx)
 		vd = VirtualDentry{
 			mount:  nextmnt,
 			dentry: nextmnt.root,
 		}
 		vd.dentry.mu.Lock()
 	}
-	// TODO: Linux requires that either both the mount point and the mount root
-	// are directories, or neither are, and returns ENOTDIR if this is not the
-	// case.
+	// TODO(gvisor.dev/issue/1035): Linux requires that either both the mount
+	// point and the mount root are directories, or neither are, and returns
+	// ENOTDIR if this is not the case.
 	mntns := vd.mount.ns
-	mnt := newMount(vfs, fs, root, mntns, opts)
 	vfs.mounts.seq.BeginWrite()
 	vfs.connectLocked(mnt, vd, mntns)
 	vfs.mounts.seq.EndWrite()
 	vd.dentry.mu.Unlock()
 	vfs.mountMu.Unlock()
 	return nil
+}
+
+// MountAt creates and mounts a Filesystem configured by the given arguments.
+// The VirtualFilesystem will hold a reference to the Mount until it is unmounted.
+//
+// This method returns the mounted Mount without a reference, for convenience
+// during VFS setup when there is no chance of racing with unmount.
+func (vfs *VirtualFilesystem) MountAt(ctx context.Context, creds *auth.Credentials, source string, target *PathOperation, fsTypeName string, opts *MountOptions) (*Mount, error) {
+	mnt, err := vfs.MountDisconnected(ctx, creds, source, fsTypeName, opts)
+	if err != nil {
+		return nil, err
+	}
+	defer mnt.DecRef(ctx)
+	if err := vfs.ConnectMountAt(ctx, creds, mnt, target); err != nil {
+		return nil, err
+	}
+	return mnt, nil
 }
 
 // UmountAt removes the Mount at the given path.
@@ -249,6 +284,9 @@ func (vfs *VirtualFilesystem) UmountAt(ctx context.Context, creds *auth.Credenti
 	}
 
 	// MNT_FORCE is currently unimplemented except for the permission check.
+	// Force unmounting specifically requires CAP_SYS_ADMIN in the root user
+	// namespace, and not in the owner user namespace for the target mount. See
+	// fs/namespace.c:SYSCALL_DEFINE2(umount, ...)
 	if opts.Flags&linux.MNT_FORCE != 0 && creds.HasCapabilityIn(linux.CAP_SYS_ADMIN, creds.UserNamespace.Root()) {
 		return syserror.EPERM
 	}
@@ -257,22 +295,22 @@ func (vfs *VirtualFilesystem) UmountAt(ctx context.Context, creds *auth.Credenti
 	if err != nil {
 		return err
 	}
-	defer vd.DecRef()
+	defer vd.DecRef(ctx)
 	if vd.dentry != vd.mount.root {
 		return syserror.EINVAL
 	}
 	vfs.mountMu.Lock()
 	if mntns := MountNamespaceFromContext(ctx); mntns != nil {
-		defer mntns.DecRef()
+		defer mntns.DecRef(ctx)
 		if mntns != vd.mount.ns {
 			vfs.mountMu.Unlock()
 			return syserror.EINVAL
 		}
 	}
 
-	// TODO(jamieliu): Linux special-cases umount of the caller's root, which
-	// we don't implement yet (we'll just fail it since the caller holds a
-	// reference on it).
+	// TODO(gvisor.dev/issue/1035): Linux special-cases umount of the caller's
+	// root, which we don't implement yet (we'll just fail it since the caller
+	// holds a reference on it).
 
 	vfs.mounts.seq.BeginWrite()
 	if opts.Flags&linux.MNT_DETACH == 0 {
@@ -299,10 +337,10 @@ func (vfs *VirtualFilesystem) UmountAt(ctx context.Context, creds *auth.Credenti
 	vfs.mounts.seq.EndWrite()
 	vfs.mountMu.Unlock()
 	for _, vd := range vdsToDecRef {
-		vd.DecRef()
+		vd.DecRef(ctx)
 	}
 	for _, mnt := range mountsToDecRef {
-		mnt.DecRef()
+		mnt.DecRef(ctx)
 	}
 	return nil
 }
@@ -333,8 +371,9 @@ type umountRecursiveOptions struct {
 //
 // umountRecursiveLocked is analogous to Linux's fs/namespace.c:umount_tree().
 //
-// Preconditions: vfs.mountMu must be locked. vfs.mounts.seq must be in a
-// writer critical section.
+// Preconditions:
+// * vfs.mountMu must be locked.
+// * vfs.mounts.seq must be in a writer critical section.
 func (vfs *VirtualFilesystem) umountRecursiveLocked(mnt *Mount, opts *umountRecursiveOptions, vdsToDecRef []VirtualDentry, mountsToDecRef []*Mount) ([]VirtualDentry, []*Mount) {
 	if !mnt.umounted {
 		mnt.umounted = true
@@ -363,15 +402,25 @@ func (vfs *VirtualFilesystem) umountRecursiveLocked(mnt *Mount, opts *umountRecu
 // connectLocked makes vd the mount parent/point for mnt. It consumes
 // references held by vd.
 //
-// Preconditions: vfs.mountMu must be locked. vfs.mounts.seq must be in a
-// writer critical section. d.mu must be locked. mnt.parent() == nil.
+// Preconditions:
+// * vfs.mountMu must be locked.
+// * vfs.mounts.seq must be in a writer critical section.
+// * d.mu must be locked.
+// * mnt.parent() == nil, i.e. mnt must not already be connected.
 func (vfs *VirtualFilesystem) connectLocked(mnt *Mount, vd VirtualDentry, mntns *MountNamespace) {
+	if checkInvariants {
+		if mnt.parent() != nil {
+			panic("VFS.connectLocked called on connected mount")
+		}
+	}
+	mnt.IncRef() // dropped by callers of umountRecursiveLocked
 	mnt.storeKey(vd)
 	if vd.mount.children == nil {
 		vd.mount.children = make(map[*Mount]struct{})
 	}
 	vd.mount.children[mnt] = struct{}{}
 	atomic.AddUint32(&vd.dentry.mounts, 1)
+	mnt.ns = mntns
 	mntns.mountpoints[vd.dentry]++
 	vfs.mounts.insertSeqed(mnt)
 	vfsmpmounts, ok := vfs.mountpoints[vd.dentry]
@@ -385,10 +434,17 @@ func (vfs *VirtualFilesystem) connectLocked(mnt *Mount, vd VirtualDentry, mntns 
 // disconnectLocked makes vd have no mount parent/point and returns its old
 // mount parent/point with a reference held.
 //
-// Preconditions: vfs.mountMu must be locked. vfs.mounts.seq must be in a
-// writer critical section. mnt.parent() != nil.
+// Preconditions:
+// * vfs.mountMu must be locked.
+// * vfs.mounts.seq must be in a writer critical section.
+// * mnt.parent() != nil.
 func (vfs *VirtualFilesystem) disconnectLocked(mnt *Mount) VirtualDentry {
 	vd := mnt.loadKey()
+	if checkInvariants {
+		if vd.mount != nil {
+			panic("VFS.disconnectLocked called on disconnected mount")
+		}
+	}
 	mnt.storeKey(VirtualDentry{})
 	delete(vd.mount.children, mnt)
 	atomic.AddUint32(&vd.dentry.mounts, math.MaxUint32) // -1
@@ -430,7 +486,7 @@ func (mnt *Mount) IncRef() {
 }
 
 // DecRef decrements mnt's reference count.
-func (mnt *Mount) DecRef() {
+func (mnt *Mount) DecRef(ctx context.Context) {
 	refs := atomic.AddInt64(&mnt.refs, -1)
 	if refs&^math.MinInt64 == 0 { // mask out MSB
 		var vd VirtualDentry
@@ -441,25 +497,18 @@ func (mnt *Mount) DecRef() {
 			mnt.vfs.mounts.seq.EndWrite()
 			mnt.vfs.mountMu.Unlock()
 		}
-		mnt.root.DecRef()
-		mnt.fs.DecRef()
+		mnt.root.DecRef(ctx)
+		mnt.fs.DecRef(ctx)
 		if vd.Ok() {
-			vd.DecRef()
+			vd.DecRef(ctx)
 		}
 	}
 }
 
-// IncRef increments mntns' reference count.
-func (mntns *MountNamespace) IncRef() {
-	if atomic.AddInt64(&mntns.refs, 1) <= 1 {
-		panic("MountNamespace.IncRef() called without holding a reference")
-	}
-}
-
 // DecRef decrements mntns' reference count.
-func (mntns *MountNamespace) DecRef() {
+func (mntns *MountNamespace) DecRef(ctx context.Context) {
 	vfs := mntns.root.fs.VirtualFilesystem()
-	if refs := atomic.AddInt64(&mntns.refs, -1); refs == 0 {
+	mntns.MountNamespaceRefs.DecRef(func() {
 		vfs.mountMu.Lock()
 		vfs.mounts.seq.BeginWrite()
 		vdsToDecRef, mountsToDecRef := vfs.umountRecursiveLocked(mntns.root, &umountRecursiveOptions{
@@ -468,14 +517,12 @@ func (mntns *MountNamespace) DecRef() {
 		vfs.mounts.seq.EndWrite()
 		vfs.mountMu.Unlock()
 		for _, vd := range vdsToDecRef {
-			vd.DecRef()
+			vd.DecRef(ctx)
 		}
 		for _, mnt := range mountsToDecRef {
-			mnt.DecRef()
+			mnt.DecRef(ctx)
 		}
-	} else if refs < 0 {
-		panic("MountNamespace.DecRef() called without holding a reference")
-	}
+	})
 }
 
 // getMountAt returns the last Mount in the stack mounted at (mnt, d). It takes
@@ -485,7 +532,7 @@ func (mntns *MountNamespace) DecRef() {
 // getMountAt is analogous to Linux's fs/namei.c:follow_mount().
 //
 // Preconditions: References are held on mnt and d.
-func (vfs *VirtualFilesystem) getMountAt(mnt *Mount, d *Dentry) *Mount {
+func (vfs *VirtualFilesystem) getMountAt(ctx context.Context, mnt *Mount, d *Dentry) *Mount {
 	// The first mount is special-cased:
 	//
 	// - The caller is assumed to have checked d.isMounted() already. (This
@@ -516,7 +563,7 @@ retryFirst:
 			// Raced with umount.
 			continue
 		}
-		mnt.DecRef()
+		mnt.DecRef(ctx)
 		mnt = next
 		d = next.root
 	}
@@ -527,9 +574,10 @@ retryFirst:
 // mnt. It takes a reference on the returned VirtualDentry. If no such mount
 // point exists (i.e. mnt is a root mount), getMountpointAt returns (nil, nil).
 //
-// Preconditions: References are held on mnt and root. vfsroot is not (mnt,
-// mnt.root).
-func (vfs *VirtualFilesystem) getMountpointAt(mnt *Mount, vfsroot VirtualDentry) VirtualDentry {
+// Preconditions:
+// * References are held on mnt and root.
+// * vfsroot is not (mnt, mnt.root).
+func (vfs *VirtualFilesystem) getMountpointAt(ctx context.Context, mnt *Mount, vfsroot VirtualDentry) VirtualDentry {
 	// The first mount is special-cased:
 	//
 	// - The caller must have already checked mnt against vfsroot.
@@ -553,12 +601,12 @@ retryFirst:
 	if !point.TryIncRef() {
 		// Since Mount holds a reference on Mount.key.point, this can only
 		// happen due to a racing change to Mount.key.
-		parent.DecRef()
+		parent.DecRef(ctx)
 		goto retryFirst
 	}
 	if !vfs.mounts.seq.ReadOk(epoch) {
-		point.DecRef()
-		parent.DecRef()
+		point.DecRef(ctx)
+		parent.DecRef(ctx)
 		goto retryFirst
 	}
 	mnt = parent
@@ -586,20 +634,27 @@ retryFirst:
 		if !point.TryIncRef() {
 			// Since Mount holds a reference on Mount.key.point, this can
 			// only happen due to a racing change to Mount.key.
-			parent.DecRef()
+			parent.DecRef(ctx)
 			goto retryNotFirst
 		}
 		if !vfs.mounts.seq.ReadOk(epoch) {
-			point.DecRef()
-			parent.DecRef()
+			point.DecRef(ctx)
+			parent.DecRef(ctx)
 			goto retryNotFirst
 		}
-		d.DecRef()
-		mnt.DecRef()
+		d.DecRef(ctx)
+		mnt.DecRef(ctx)
 		mnt = parent
 		d = point
 	}
 	return VirtualDentry{mnt, d}
+}
+
+// SetMountReadOnly sets the mount as ReadOnly.
+func (vfs *VirtualFilesystem) SetMountReadOnly(mnt *Mount, ro bool) error {
+	vfs.mountMu.Lock()
+	defer vfs.mountMu.Unlock()
+	return mnt.setReadOnlyLocked(ro)
 }
 
 // CheckBeginWrite increments the counter of in-progress write operations on
@@ -639,10 +694,33 @@ func (mnt *Mount) setReadOnlyLocked(ro bool) error {
 	return nil
 }
 
+// ReadOnly returns true if mount is readonly.
+func (mnt *Mount) ReadOnly() bool {
+	return atomic.LoadInt64(&mnt.writers) < 0
+}
+
 // Filesystem returns the mounted Filesystem. It does not take a reference on
 // the returned Filesystem.
 func (mnt *Mount) Filesystem() *Filesystem {
 	return mnt.fs
+}
+
+// submountsLocked returns this Mount and all Mounts that are descendents of
+// it.
+//
+// Precondition: mnt.vfs.mountMu must be held.
+func (mnt *Mount) submountsLocked() []*Mount {
+	mounts := []*Mount{mnt}
+	for m := range mnt.children {
+		mounts = append(mounts, m.submountsLocked()...)
+	}
+	return mounts
+}
+
+// Root returns the mount's root. It does not take a reference on the returned
+// Dentry.
+func (mnt *Mount) Root() *Dentry {
+	return mnt.root
 }
 
 // Root returns mntns' root. A reference is taken on the returned
@@ -654,4 +732,209 @@ func (mntns *MountNamespace) Root() VirtualDentry {
 	}
 	vd.IncRef()
 	return vd
+}
+
+// GenerateProcMounts emits the contents of /proc/[pid]/mounts for vfs to buf.
+//
+// Preconditions: taskRootDir.Ok().
+func (vfs *VirtualFilesystem) GenerateProcMounts(ctx context.Context, taskRootDir VirtualDentry, buf *bytes.Buffer) {
+	rootMnt := taskRootDir.mount
+
+	vfs.mountMu.Lock()
+	mounts := rootMnt.submountsLocked()
+	// Take a reference on mounts since we need to drop vfs.mountMu before
+	// calling vfs.PathnameReachable() (=> FilesystemImpl.PrependPath()).
+	for _, mnt := range mounts {
+		mnt.IncRef()
+	}
+	vfs.mountMu.Unlock()
+	defer func() {
+		for _, mnt := range mounts {
+			mnt.DecRef(ctx)
+		}
+	}()
+	sort.Slice(mounts, func(i, j int) bool { return mounts[i].ID < mounts[j].ID })
+
+	for _, mnt := range mounts {
+		// Get the path to this mount relative to task root.
+		mntRootVD := VirtualDentry{
+			mount:  mnt,
+			dentry: mnt.root,
+		}
+		path, err := vfs.PathnameReachable(ctx, taskRootDir, mntRootVD)
+		if err != nil {
+			// For some reason we didn't get a path. Log a warning
+			// and run with empty path.
+			ctx.Warningf("VFS.GenerateProcMounts: error getting pathname for mount root %+v: %v", mnt.root, err)
+			path = ""
+		}
+		if path == "" {
+			// Either an error occurred, or path is not reachable
+			// from root.
+			break
+		}
+
+		opts := "rw"
+		if mnt.ReadOnly() {
+			opts = "ro"
+		}
+		if mnt.Flags.NoATime {
+			opts = ",noatime"
+		}
+		if mnt.Flags.NoExec {
+			opts += ",noexec"
+		}
+
+		// Format:
+		// <special device or remote filesystem> <mount point> <filesystem type> <mount options> <needs dump> <fsck order>
+		//
+		// The "needs dump" and "fsck order" flags are always 0, which
+		// is allowed.
+		fmt.Fprintf(buf, "%s %s %s %s %d %d\n", "none", path, mnt.fs.FilesystemType().Name(), opts, 0, 0)
+	}
+}
+
+// GenerateProcMountInfo emits the contents of /proc/[pid]/mountinfo for vfs to
+// buf.
+//
+// Preconditions: taskRootDir.Ok().
+func (vfs *VirtualFilesystem) GenerateProcMountInfo(ctx context.Context, taskRootDir VirtualDentry, buf *bytes.Buffer) {
+	rootMnt := taskRootDir.mount
+
+	vfs.mountMu.Lock()
+	mounts := rootMnt.submountsLocked()
+	// Take a reference on mounts since we need to drop vfs.mountMu before
+	// calling vfs.PathnameReachable() (=> FilesystemImpl.PrependPath()) or
+	// vfs.StatAt() (=> FilesystemImpl.StatAt()).
+	for _, mnt := range mounts {
+		mnt.IncRef()
+	}
+	vfs.mountMu.Unlock()
+	defer func() {
+		for _, mnt := range mounts {
+			mnt.DecRef(ctx)
+		}
+	}()
+	sort.Slice(mounts, func(i, j int) bool { return mounts[i].ID < mounts[j].ID })
+
+	creds := auth.CredentialsFromContext(ctx)
+	for _, mnt := range mounts {
+		// Get the path to this mount relative to task root.
+		mntRootVD := VirtualDentry{
+			mount:  mnt,
+			dentry: mnt.root,
+		}
+		path, err := vfs.PathnameReachable(ctx, taskRootDir, mntRootVD)
+		if err != nil {
+			// For some reason we didn't get a path. Log a warning
+			// and run with empty path.
+			ctx.Warningf("VFS.GenerateProcMountInfo: error getting pathname for mount root %+v: %v", mnt.root, err)
+			path = ""
+		}
+		if path == "" {
+			// Either an error occurred, or path is not reachable
+			// from root.
+			break
+		}
+		// Stat the mount root to get the major/minor device numbers.
+		pop := &PathOperation{
+			Root:  mntRootVD,
+			Start: mntRootVD,
+		}
+		statx, err := vfs.StatAt(ctx, creds, pop, &StatOptions{})
+		if err != nil {
+			// Well that's not good. Ignore this mount.
+			ctx.Warningf("VFS.GenerateProcMountInfo: failed to stat mount root %+v: %v", mnt.root, err)
+			break
+		}
+
+		// Format:
+		// 36 35 98:0 /mnt1 /mnt2 rw,noatime master:1 - ext3 /dev/root rw,errors=continue
+		// (1)(2)(3)   (4)   (5)      (6)      (7)   (8) (9)   (10)         (11)
+
+		// (1) Mount ID.
+		fmt.Fprintf(buf, "%d ", mnt.ID)
+
+		// (2)  Parent ID (or this ID if there is no parent).
+		// Note that even if the call to mnt.parent() races with Mount
+		// destruction (which is possible since we're not holding vfs.mountMu),
+		// its Mount.ID will still be valid.
+		pID := mnt.ID
+		if p := mnt.parent(); p != nil {
+			pID = p.ID
+		}
+		fmt.Fprintf(buf, "%d ", pID)
+
+		// (3) Major:Minor device ID. We don't have a superblock, so we
+		// just use the root inode device number.
+		fmt.Fprintf(buf, "%d:%d ", statx.DevMajor, statx.DevMinor)
+
+		// (4) Root: the pathname of the directory in the filesystem
+		// which forms the root of this mount.
+		//
+		// NOTE(b/78135857): This will always be "/" until we implement
+		// bind mounts.
+		fmt.Fprintf(buf, "/ ")
+
+		// (5) Mount point (relative to process root).
+		fmt.Fprintf(buf, "%s ", manglePath(path))
+
+		// (6) Mount options.
+		opts := "rw"
+		if mnt.ReadOnly() {
+			opts = "ro"
+		}
+		if mnt.Flags.NoATime {
+			opts = ",noatime"
+		}
+		if mnt.Flags.NoExec {
+			opts += ",noexec"
+		}
+		fmt.Fprintf(buf, "%s ", opts)
+
+		// (7) Optional fields: zero or more fields of the form "tag[:value]".
+		// (8) Separator: the end of the optional fields is marked by a single hyphen.
+		fmt.Fprintf(buf, "- ")
+
+		// (9) Filesystem type.
+		fmt.Fprintf(buf, "%s ", mnt.fs.FilesystemType().Name())
+
+		// (10) Mount source: filesystem-specific information or "none".
+		fmt.Fprintf(buf, "none ")
+
+		// (11) Superblock options, and final newline.
+		fmt.Fprintf(buf, "%s\n", superBlockOpts(path, mnt))
+	}
+}
+
+// manglePath replaces ' ', '\t', '\n', and '\\' with their octal equivalents.
+// See Linux fs/seq_file.c:mangle_path.
+func manglePath(p string) string {
+	r := strings.NewReplacer(" ", "\\040", "\t", "\\011", "\n", "\\012", "\\", "\\134")
+	return r.Replace(p)
+}
+
+// superBlockOpts returns the super block options string for the the mount at
+// the given path.
+func superBlockOpts(mountPath string, mnt *Mount) string {
+	// gVisor doesn't (yet) have a concept of super block options, so we
+	// use the ro/rw bit from the mount flag.
+	opts := "rw"
+	if mnt.ReadOnly() {
+		opts = "ro"
+	}
+
+	// NOTE(b/147673608): If the mount is a cgroup, we also need to include
+	// the cgroup name in the options. For now we just read that from the
+	// path.
+	//
+	// TODO(gvisor.dev/issue/190): Once gVisor has full cgroup support, we
+	// should get this value from the cgroup itself, and not rely on the
+	// path.
+	if mnt.fs.FilesystemType().Name() == "cgroup" {
+		splitPath := strings.Split(mountPath, "/")
+		cgroupType := splitPath[len(splitPath)-1]
+		opts += "," + cgroupType
+	}
+	return opts
 }

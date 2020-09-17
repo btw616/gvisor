@@ -317,6 +317,64 @@ func (r *Rclunk) String() string {
 	return "Rclunk{}"
 }
 
+// Tsetattrclunk is a setattr+close request.
+type Tsetattrclunk struct {
+	// FID is the FID to change.
+	FID FID
+
+	// Valid is the set of bits which will be used.
+	Valid SetAttrMask
+
+	// SetAttr is the set request.
+	SetAttr SetAttr
+}
+
+// decode implements encoder.decode.
+func (t *Tsetattrclunk) decode(b *buffer) {
+	t.FID = b.ReadFID()
+	t.Valid.decode(b)
+	t.SetAttr.decode(b)
+}
+
+// encode implements encoder.encode.
+func (t *Tsetattrclunk) encode(b *buffer) {
+	b.WriteFID(t.FID)
+	t.Valid.encode(b)
+	t.SetAttr.encode(b)
+}
+
+// Type implements message.Type.
+func (*Tsetattrclunk) Type() MsgType {
+	return MsgTsetattrclunk
+}
+
+// String implements fmt.Stringer.
+func (t *Tsetattrclunk) String() string {
+	return fmt.Sprintf("Tsetattrclunk{FID: %d, Valid: %v, SetAttr: %s}", t.FID, t.Valid, t.SetAttr)
+}
+
+// Rsetattrclunk is a setattr+close response.
+type Rsetattrclunk struct {
+}
+
+// decode implements encoder.decode.
+func (*Rsetattrclunk) decode(*buffer) {
+}
+
+// encode implements encoder.encode.
+func (*Rsetattrclunk) encode(*buffer) {
+}
+
+// Type implements message.Type.
+func (*Rsetattrclunk) Type() MsgType {
+	return MsgRsetattrclunk
+}
+
+// String implements fmt.Stringer.
+func (r *Rsetattrclunk) String() string {
+	return "Rsetattrclunk{}"
+}
+
 // Tremove is a remove request.
 //
 // This will eventually be replaced by Tunlinkat.
@@ -1926,19 +1984,17 @@ func (r *Rreaddir) decode(b *buffer) {
 // encode implements encoder.encode.
 func (r *Rreaddir) encode(b *buffer) {
 	entriesBuf := buffer{}
+	payloadSize := 0
 	for _, d := range r.Entries {
 		d.encode(&entriesBuf)
-		if len(entriesBuf.data) >= int(r.Count) {
+		if len(entriesBuf.data) > int(r.Count) {
 			break
 		}
+		payloadSize = len(entriesBuf.data)
 	}
-	if len(entriesBuf.data) < int(r.Count) {
-		r.Count = uint32(len(entriesBuf.data))
-		r.payload = entriesBuf.data
-	} else {
-		r.payload = entriesBuf.data[:r.Count]
-	}
-	b.Write32(uint32(r.Count))
+	r.Count = uint32(payloadSize)
+	r.payload = entriesBuf.data[:payloadSize]
+	b.Write32(r.Count)
 }
 
 // Type implements message.Type.
@@ -2508,7 +2564,7 @@ type msgFactory struct {
 var msgRegistry registry
 
 type registry struct {
-	factories [math.MaxUint8]msgFactory
+	factories [math.MaxUint8 + 1]msgFactory
 
 	// largestFixedSize is computed so that given some message size M, you can
 	// compute the maximum payload size (e.g. for Twrite, Rread) with
@@ -2659,6 +2715,8 @@ func init() {
 	msgRegistry.register(MsgRlconnect, func() message { return &Rlconnect{} })
 	msgRegistry.register(MsgTallocate, func() message { return &Tallocate{} })
 	msgRegistry.register(MsgRallocate, func() message { return &Rallocate{} })
+	msgRegistry.register(MsgTsetattrclunk, func() message { return &Tsetattrclunk{} })
+	msgRegistry.register(MsgRsetattrclunk, func() message { return &Rsetattrclunk{} })
 	msgRegistry.register(MsgTchannel, func() message { return &Tchannel{} })
 	msgRegistry.register(MsgRchannel, func() message { return &Rchannel{} })
 }

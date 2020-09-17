@@ -17,6 +17,7 @@ package header
 import (
 	"crypto/sha256"
 	"encoding/binary"
+	"fmt"
 	"strings"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -27,7 +28,9 @@ const (
 	// IPv6PayloadLenOffset is the offset of the PayloadLength field in
 	// IPv6 header.
 	IPv6PayloadLenOffset = 4
-	nextHdr              = 6
+	// IPv6NextHeaderOffset is the offset of the NextHeader field in
+	// IPv6 header.
+	IPv6NextHeaderOffset = 6
 	hopLimit             = 7
 	v6SrcAddr            = 8
 	v6DstAddr            = v6SrcAddr + IPv6AddressSize
@@ -71,6 +74,10 @@ const (
 	// IPv6AddressSize is the size, in bytes, of an IPv6 address.
 	IPv6AddressSize = 16
 
+	// IPv6MaximumPayloadSize is the maximum size of a valid IPv6 payload per
+	// RFC 8200 Section 4.5.
+	IPv6MaximumPayloadSize = 65535
+
 	// IPv6ProtocolNumber is IPv6's network protocol number.
 	IPv6ProtocolNumber tcpip.NetworkProtocolNumber = 0x86dd
 
@@ -94,6 +101,9 @@ const (
 	// IPv6MinimumMTU is the minimum MTU required by IPv6, per RFC 2460,
 	// section 5.
 	IPv6MinimumMTU = 1280
+
+	// IPv6Loopback is the IPv6 Loopback address.
+	IPv6Loopback tcpip.Address = "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x01"
 
 	// IPv6Any is the non-routable IPv6 "any" meta address. It is also
 	// known as the unspecified address.
@@ -163,7 +173,7 @@ func (b IPv6) HopLimit() uint8 {
 
 // NextHeader returns the value of the "next header" field of the ipv6 header.
 func (b IPv6) NextHeader() uint8 {
-	return b[nextHdr]
+	return b[IPv6NextHeaderOffset]
 }
 
 // TransportProtocol implements Network.TransportProtocol.
@@ -223,7 +233,7 @@ func (b IPv6) SetDestinationAddress(addr tcpip.Address) {
 
 // SetNextHeader sets the value of the "next header" field of the ipv6 header.
 func (b IPv6) SetNextHeader(v uint8) {
-	b[nextHdr] = v
+	b[IPv6NextHeaderOffset] = v
 }
 
 // SetChecksum implements Network.SetChecksum. Given that IPv6 doesn't have a
@@ -235,7 +245,7 @@ func (IPv6) SetChecksum(uint16) {
 func (b IPv6) Encode(i *IPv6Fields) {
 	b.SetTOS(i.TrafficClass, i.FlowLabel)
 	b.SetPayloadLength(i.PayloadLength)
-	b[nextHdr] = i.NextHeader
+	b[IPv6NextHeaderOffset] = i.NextHeader
 	b[hopLimit] = i.HopLimit
 	b.SetSourceAddress(i.SrcAddr)
 	b.SetDestinationAddress(i.DstAddr)
@@ -441,5 +451,56 @@ func ScopeForIPv6Address(addr tcpip.Address) (IPv6AddressScope, *tcpip.Error) {
 
 	default:
 		return GlobalScope, nil
+	}
+}
+
+// InitialTempIID generates the initial temporary IID history value to generate
+// temporary SLAAC addresses with.
+//
+// Panics if initialTempIIDHistory is not at least IIDSize bytes.
+func InitialTempIID(initialTempIIDHistory []byte, seed []byte, nicID tcpip.NICID) {
+	h := sha256.New()
+	// h.Write never returns an error.
+	h.Write(seed)
+	var nicIDBuf [4]byte
+	binary.BigEndian.PutUint32(nicIDBuf[:], uint32(nicID))
+	h.Write(nicIDBuf[:])
+
+	var sumBuf [sha256.Size]byte
+	sum := h.Sum(sumBuf[:0])
+
+	if n := copy(initialTempIIDHistory, sum[sha256.Size-IIDSize:]); n != IIDSize {
+		panic(fmt.Sprintf("copied %d bytes, expected %d bytes", n, IIDSize))
+	}
+}
+
+// GenerateTempIPv6SLAACAddr generates a temporary SLAAC IPv6 address for an
+// associated stable/permanent SLAAC address.
+//
+// GenerateTempIPv6SLAACAddr will update the temporary IID history value to be
+// used when generating a new temporary IID.
+//
+// Panics if tempIIDHistory is not at least IIDSize bytes.
+func GenerateTempIPv6SLAACAddr(tempIIDHistory []byte, stableAddr tcpip.Address) tcpip.AddressWithPrefix {
+	addrBytes := []byte(stableAddr)
+	h := sha256.New()
+	h.Write(tempIIDHistory)
+	h.Write(addrBytes[IIDOffsetInIPv6Address:])
+	var sumBuf [sha256.Size]byte
+	sum := h.Sum(sumBuf[:0])
+
+	// The rightmost 64 bits of sum are saved for the next iteration.
+	if n := copy(tempIIDHistory, sum[sha256.Size-IIDSize:]); n != IIDSize {
+		panic(fmt.Sprintf("copied %d bytes, expected %d bytes", n, IIDSize))
+	}
+
+	// The leftmost 64 bits of sum is used as the IID.
+	if n := copy(addrBytes[IIDOffsetInIPv6Address:], sum); n != IIDSize {
+		panic(fmt.Sprintf("copied %d IID bytes, expected %d bytes", n, IIDSize))
+	}
+
+	return tcpip.AddressWithPrefix{
+		Address:   tcpip.Address(addrBytes),
+		PrefixLen: IIDOffsetInIPv6Address * 8,
 	}
 }

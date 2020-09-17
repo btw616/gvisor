@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build amd64 i386
+// +build amd64 386
 
 package arch
 
@@ -21,7 +21,7 @@ import (
 	"io"
 	"syscall"
 
-	"gvisor.dev/gvisor/pkg/binary"
+	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/cpuid"
 	"gvisor.dev/gvisor/pkg/log"
 	rpb "gvisor.dev/gvisor/pkg/sentry/arch/registers_go_proto"
@@ -29,6 +29,13 @@ import (
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
+
+// Registers represents the CPU registers for this architecture.
+//
+// +stateify savable
+type Registers struct {
+	linux.PtraceRegs
+}
 
 // System-related constants for x86.
 const (
@@ -267,10 +274,12 @@ func (s *State) RegisterMap() (map[string]uintptr, error) {
 
 // PtraceGetRegs implements Context.PtraceGetRegs.
 func (s *State) PtraceGetRegs(dst io.Writer) (int, error) {
-	return dst.Write(binary.Marshal(nil, usermem.ByteOrder, s.ptraceGetRegs()))
+	regs := s.ptraceGetRegs()
+	n, err := regs.WriteTo(dst)
+	return int(n), err
 }
 
-func (s *State) ptraceGetRegs() syscall.PtraceRegs {
+func (s *State) ptraceGetRegs() Registers {
 	regs := s.Regs
 	// These may not be initialized.
 	if regs.Cs == 0 || regs.Ss == 0 || regs.Eflags == 0 {
@@ -306,16 +315,16 @@ func (s *State) ptraceGetRegs() syscall.PtraceRegs {
 	return regs
 }
 
-var ptraceRegsSize = int(binary.Size(syscall.PtraceRegs{}))
+var ptraceRegistersSize = (*linux.PtraceRegs)(nil).SizeBytes()
 
 // PtraceSetRegs implements Context.PtraceSetRegs.
 func (s *State) PtraceSetRegs(src io.Reader) (int, error) {
-	var regs syscall.PtraceRegs
-	buf := make([]byte, ptraceRegsSize)
+	var regs Registers
+	buf := make([]byte, ptraceRegistersSize)
 	if _, err := io.ReadFull(src, buf); err != nil {
 		return 0, err
 	}
-	binary.Unmarshal(buf, usermem.ByteOrder, &regs)
+	regs.UnmarshalUnsafe(buf)
 	// Truncate segment registers to 16 bits.
 	regs.Cs = uint64(uint16(regs.Cs))
 	regs.Ds = uint64(uint16(regs.Ds))
@@ -369,7 +378,7 @@ func (s *State) PtraceSetRegs(src io.Reader) (int, error) {
 	}
 	regs.Eflags = (s.Regs.Eflags &^ eflagsPtraceMutable) | (regs.Eflags & eflagsPtraceMutable)
 	s.Regs = regs
-	return ptraceRegsSize, nil
+	return ptraceRegistersSize, nil
 }
 
 // isUserSegmentSelector returns true if the given segment selector specifies a
@@ -538,7 +547,7 @@ const (
 func (s *State) PtraceGetRegSet(regset uintptr, dst io.Writer, maxlen int) (int, error) {
 	switch regset {
 	case _NT_PRSTATUS:
-		if maxlen < ptraceRegsSize {
+		if maxlen < ptraceRegistersSize {
 			return 0, syserror.EFAULT
 		}
 		return s.PtraceGetRegs(dst)
@@ -558,7 +567,7 @@ func (s *State) PtraceGetRegSet(regset uintptr, dst io.Writer, maxlen int) (int,
 func (s *State) PtraceSetRegSet(regset uintptr, src io.Reader, maxlen int) (int, error) {
 	switch regset {
 	case _NT_PRSTATUS:
-		if maxlen < ptraceRegsSize {
+		if maxlen < ptraceRegistersSize {
 			return 0, syserror.EFAULT
 		}
 		return s.PtraceSetRegs(src)

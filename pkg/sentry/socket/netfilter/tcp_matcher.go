@@ -96,8 +96,8 @@ func (*TCPMatcher) Name() string {
 }
 
 // Match implements Matcher.Match.
-func (tm *TCPMatcher) Match(hook stack.Hook, pkt stack.PacketBuffer, interfaceName string) (bool, bool) {
-	netHeader := header.IPv4(pkt.NetworkHeader)
+func (tm *TCPMatcher) Match(hook stack.Hook, pkt *stack.PacketBuffer, interfaceName string) (bool, bool) {
+	netHeader := header.IPv4(pkt.NetworkHeader().View())
 
 	if netHeader.TransportProtocol() != header.TCPProtocolNumber {
 		return false, false
@@ -111,22 +111,10 @@ func (tm *TCPMatcher) Match(hook stack.Hook, pkt stack.PacketBuffer, interfaceNa
 		return false, false
 	}
 
-	// Now we need the transport header. However, this may not have been set
-	// yet.
-	// TODO(gvisor.dev/issue/170): Parsing the transport header should
-	// ultimately be moved into the stack.Check codepath as matchers are
-	// added.
-	var tcpHeader header.TCP
-	if pkt.TransportHeader != nil {
-		tcpHeader = header.TCP(pkt.TransportHeader)
-	} else {
-		// The TCP header hasn't been parsed yet. We have to do it here.
-		if len(pkt.Data.First()) < header.TCPMinimumSize {
-			// There's no valid TCP header here, so we hotdrop the
-			// packet.
-			return false, true
-		}
-		tcpHeader = header.TCP(pkt.Data.First())
+	tcpHeader := header.TCP(pkt.TransportHeader().View())
+	if len(tcpHeader) < header.TCPMinimumSize {
+		// There's no valid TCP header here, so we drop the packet immediately.
+		return false, true
 	}
 
 	// Check whether the source and destination ports are within the

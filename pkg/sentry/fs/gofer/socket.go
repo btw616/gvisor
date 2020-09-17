@@ -47,6 +47,8 @@ func (i *inodeOperations) BoundEndpoint(inode *fs.Inode, path string) transport.
 	return &endpoint{inode, i.fileState.file.file, path}
 }
 
+// LINT.IfChange
+
 // endpoint is a Gofer-backed transport.BoundEndpoint.
 //
 // An endpoint's lifetime is the time between when InodeOperations.BoundEndpoint()
@@ -132,17 +134,19 @@ func (e *endpoint) UnidirectionalConnect(ctx context.Context) (transport.Connect
 
 	// We don't need the receiver.
 	c.CloseRecv()
-	c.Release()
+	c.Release(ctx)
 
 	return c, nil
 }
 
 // Release implements transport.BoundEndpoint.Release.
-func (e *endpoint) Release() {
-	e.inode.DecRef()
+func (e *endpoint) Release(ctx context.Context) {
+	e.inode.DecRef(ctx)
 }
 
 // Passcred implements transport.BoundEndpoint.Passcred.
 func (e *endpoint) Passcred() bool {
 	return false
 }
+
+// LINT.ThenChange(../../fsimpl/gofer/socket.go)

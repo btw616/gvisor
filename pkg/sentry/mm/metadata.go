@@ -15,6 +15,7 @@
 package mm
 
 import (
+	"gvisor.dev/gvisor/pkg/context"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fsbridge"
 	"gvisor.dev/gvisor/pkg/usermem"
@@ -147,7 +148,7 @@ func (mm *MemoryManager) Executable() fsbridge.File {
 // SetExecutable sets the executable.
 //
 // This takes a reference on d.
-func (mm *MemoryManager) SetExecutable(file fsbridge.File) {
+func (mm *MemoryManager) SetExecutable(ctx context.Context, file fsbridge.File) {
 	mm.metadataMu.Lock()
 
 	// Grab a new reference.
@@ -164,6 +165,20 @@ func (mm *MemoryManager) SetExecutable(file fsbridge.File) {
 	// Do this without holding the lock, since it may wind up doing some
 	// I/O to sync the dirent, etc.
 	if orig != nil {
-		orig.DecRef()
+		orig.DecRef(ctx)
 	}
+}
+
+// VDSOSigReturn returns the address of vdso_sigreturn.
+func (mm *MemoryManager) VDSOSigReturn() uint64 {
+	mm.metadataMu.Lock()
+	defer mm.metadataMu.Unlock()
+	return mm.vdsoSigReturnAddr
+}
+
+// SetVDSOSigReturn sets the address of vdso_sigreturn.
+func (mm *MemoryManager) SetVDSOSigReturn(addr uint64) {
+	mm.metadataMu.Lock()
+	defer mm.metadataMu.Unlock()
+	mm.vdsoSigReturnAddr = addr
 }

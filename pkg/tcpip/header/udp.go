@@ -16,6 +16,7 @@ package header
 
 import (
 	"encoding/binary"
+	"math"
 
 	"gvisor.dev/gvisor/pkg/tcpip"
 )
@@ -54,6 +55,10 @@ type UDP []byte
 const (
 	// UDPMinimumSize is the minimum size of a valid UDP packet.
 	UDPMinimumSize = 8
+
+	// UDPMaximumSize is the maximum size of a valid UDP packet. The length field
+	// in the UDP header is 16 bits as per RFC 768.
+	UDPMaximumSize = math.MaxUint16
 
 	// UDPProtocolNumber is UDP's transport protocol number.
 	UDPProtocolNumber tcpip.TransportProtocolNumber = 17
@@ -97,6 +102,11 @@ func (b UDP) SetDestinationPort(port uint16) {
 // SetChecksum sets the "checksum" field of the udp header.
 func (b UDP) SetChecksum(checksum uint16) {
 	binary.BigEndian.PutUint16(b[udpChecksum:], checksum)
+}
+
+// SetLength sets the "length" field of the udp header.
+func (b UDP) SetLength(length uint16) {
+	binary.BigEndian.PutUint16(b[udpLength:], length)
 }
 
 // CalculateChecksum calculates the checksum of the udp packet, given the

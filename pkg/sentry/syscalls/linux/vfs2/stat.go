@@ -65,7 +65,7 @@ func fstatat(t *kernel.Task, dirfd int32, pathAddr, statAddr usermem.Addr, flags
 	}
 
 	root := t.FSContext().RootDirectoryVFS2()
-	defer root.DecRef()
+	defer root.DecRef(t)
 	start := root
 	if !path.Absolute {
 		if !path.HasComponents() && flags&linux.AT_EMPTY_PATH == 0 {
@@ -73,7 +73,7 @@ func fstatat(t *kernel.Task, dirfd int32, pathAddr, statAddr usermem.Addr, flags
 		}
 		if dirfd == linux.AT_FDCWD {
 			start = t.FSContext().WorkingDirectoryVFS2()
-			defer start.DecRef()
+			defer start.DecRef(t)
 		} else {
 			dirfile := t.GetFileVFS2(dirfd)
 			if dirfile == nil {
@@ -85,18 +85,19 @@ func fstatat(t *kernel.Task, dirfd int32, pathAddr, statAddr usermem.Addr, flags
 				// former may be able to use opened file state to expedite the
 				// Stat.
 				statx, err := dirfile.Stat(t, opts)
-				dirfile.DecRef()
+				dirfile.DecRef(t)
 				if err != nil {
 					return err
 				}
 				var stat linux.Stat
 				convertStatxToUserStat(t, &statx, &stat)
-				return stat.CopyOut(t, statAddr)
+				_, err = stat.CopyOut(t, statAddr)
+				return err
 			}
 			start = dirfile.VirtualDentry()
 			start.IncRef()
-			defer start.DecRef()
-			dirfile.DecRef()
+			defer start.DecRef(t)
+			dirfile.DecRef(t)
 		}
 	}
 
@@ -111,7 +112,8 @@ func fstatat(t *kernel.Task, dirfd int32, pathAddr, statAddr usermem.Addr, flags
 	}
 	var stat linux.Stat
 	convertStatxToUserStat(t, &statx, &stat)
-	return stat.CopyOut(t, statAddr)
+	_, err = stat.CopyOut(t, statAddr)
+	return err
 }
 
 func timespecFromStatxTimestamp(sxts linux.StatxTimestamp) linux.Timespec {
@@ -130,7 +132,7 @@ func Fstat(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 	if file == nil {
 		return 0, nil, syserror.EBADF
 	}
-	defer file.DecRef()
+	defer file.DecRef(t)
 
 	statx, err := file.Stat(t, vfs.StatOptions{
 		Mask: linux.STATX_BASIC_STATS,
@@ -140,7 +142,8 @@ func Fstat(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 	}
 	var stat linux.Stat
 	convertStatxToUserStat(t, &statx, &stat)
-	return 0, nil, stat.CopyOut(t, statAddr)
+	_, err = stat.CopyOut(t, statAddr)
+	return 0, nil, err
 }
 
 // Statx implements Linux syscall statx(2).
@@ -174,7 +177,7 @@ func Statx(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 	}
 
 	root := t.FSContext().RootDirectoryVFS2()
-	defer root.DecRef()
+	defer root.DecRef(t)
 	start := root
 	if !path.Absolute {
 		if !path.HasComponents() && flags&linux.AT_EMPTY_PATH == 0 {
@@ -182,7 +185,7 @@ func Statx(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		}
 		if dirfd == linux.AT_FDCWD {
 			start = t.FSContext().WorkingDirectoryVFS2()
-			defer start.DecRef()
+			defer start.DecRef(t)
 		} else {
 			dirfile := t.GetFileVFS2(dirfd)
 			if dirfile == nil {
@@ -194,17 +197,18 @@ func Statx(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 				// former may be able to use opened file state to expedite the
 				// Stat.
 				statx, err := dirfile.Stat(t, opts)
-				dirfile.DecRef()
+				dirfile.DecRef(t)
 				if err != nil {
 					return 0, nil, err
 				}
 				userifyStatx(t, &statx)
-				return 0, nil, statx.CopyOut(t, statxAddr)
+				_, err = statx.CopyOut(t, statxAddr)
+				return 0, nil, err
 			}
 			start = dirfile.VirtualDentry()
 			start.IncRef()
-			defer start.DecRef()
-			dirfile.DecRef()
+			defer start.DecRef(t)
+			dirfile.DecRef(t)
 		}
 	}
 
@@ -218,7 +222,8 @@ func Statx(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 		return 0, nil, err
 	}
 	userifyStatx(t, &statx)
-	return 0, nil, statx.CopyOut(t, statxAddr)
+	_, err = statx.CopyOut(t, statxAddr)
+	return 0, nil, err
 }
 
 func userifyStatx(t *kernel.Task, statx *linux.Statx) {
@@ -277,7 +282,7 @@ func accessAt(t *kernel.Task, dirfd int32, pathAddr usermem.Addr, mode uint) err
 	if err != nil {
 		return err
 	}
-	defer tpop.Release()
+	defer tpop.Release(t)
 
 	// access(2) and faccessat(2) check permissions using real
 	// UID/GID, not effective UID/GID.
@@ -323,7 +328,7 @@ func readlinkat(t *kernel.Task, dirfd int32, pathAddr, bufAddr usermem.Addr, siz
 	if err != nil {
 		return 0, nil, err
 	}
-	defer tpop.Release()
+	defer tpop.Release(t)
 
 	target, err := t.Kernel().VFS().ReadlinkAt(t, t.Credentials(), &tpop.pop)
 	if err != nil {
@@ -353,14 +358,14 @@ func Statfs(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscal
 	if err != nil {
 		return 0, nil, err
 	}
-	defer tpop.Release()
+	defer tpop.Release(t)
 
 	statfs, err := t.Kernel().VFS().StatFSAt(t, t.Credentials(), &tpop.pop)
 	if err != nil {
 		return 0, nil, err
 	}
-
-	return 0, nil, statfs.CopyOut(t, bufAddr)
+	_, err = statfs.CopyOut(t, bufAddr)
+	return 0, nil, err
 }
 
 // Fstatfs implements Linux syscall fstatfs(2).
@@ -372,12 +377,12 @@ func Fstatfs(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysca
 	if err != nil {
 		return 0, nil, err
 	}
-	defer tpop.Release()
+	defer tpop.Release(t)
 
 	statfs, err := t.Kernel().VFS().StatFSAt(t, t.Credentials(), &tpop.pop)
 	if err != nil {
 		return 0, nil, err
 	}
-
-	return 0, nil, statfs.CopyOut(t, bufAddr)
+	_, err = statfs.CopyOut(t, bufAddr)
+	return 0, nil, err
 }

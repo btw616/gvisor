@@ -19,6 +19,7 @@ import (
 	"syscall"
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
+	"gvisor.dev/gvisor/pkg/log"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -98,9 +99,12 @@ func (c *context64) SignalSetup(st *Stack, act *SignalAct, info *SignalInfo, alt
 	if ucSize < 0 {
 		panic("can't get size of UContext64")
 	}
-	// st.Arch.Width() is for the restorer address. sizeof(siginfo) == 128.
-	frameSize := int(st.Arch.Width()) + ucSize + 128
-	frameBottom := (sp-usermem.Addr(frameSize)) & ^usermem.Addr(15) - 8
+
+	// frameSize = ucSize + sizeof(siginfo).
+	// sizeof(siginfo) == 128.
+	// R30 stores the restorer address.
+	frameSize := ucSize + 128
+	frameBottom := (sp - usermem.Addr(frameSize)) & ^usermem.Addr(15)
 	sp = frameBottom + usermem.Addr(frameSize)
 	st.Bottom = sp
 
@@ -130,12 +134,48 @@ func (c *context64) SignalSetup(st *Stack, act *SignalAct, info *SignalInfo, alt
 	c.Regs.Regs[0] = uint64(info.Signo)
 	c.Regs.Regs[1] = uint64(infoAddr)
 	c.Regs.Regs[2] = uint64(ucAddr)
+	c.Regs.Regs[30] = uint64(act.Restorer)
 
+	// Save the thread's floating point state.
+	c.sigFPState = append(c.sigFPState, c.aarch64FPState)
+	// Signal handler gets a clean floating point state.
+	c.aarch64FPState = newAarch64FPState()
 	return nil
 }
 
 // SignalRestore implements Context.SignalRestore.
-// Only used on intel.
 func (c *context64) SignalRestore(st *Stack, rt bool) (linux.SignalSet, SignalStack, error) {
-	return 0, SignalStack{}, nil
+	// Copy out the stack frame.
+	var uc UContext64
+	if _, err := st.Pop(&uc); err != nil {
+		return 0, SignalStack{}, err
+	}
+	var info SignalInfo
+	if _, err := st.Pop(&info); err != nil {
+		return 0, SignalStack{}, err
+	}
+
+	// Restore registers.
+	c.Regs.Regs = uc.MContext.Regs
+	c.Regs.Pc = uc.MContext.Pc
+	c.Regs.Sp = uc.MContext.Sp
+	c.Regs.Pstate = uc.MContext.Pstate
+
+	// Restore floating point state.
+	l := len(c.sigFPState)
+	if l > 0 {
+		c.aarch64FPState = c.sigFPState[l-1]
+		// NOTE(cl/133042258): State save requires that any slice
+		// elements from '[len:cap]' to be zero value.
+		c.sigFPState[l-1] = nil
+		c.sigFPState = c.sigFPState[0 : l-1]
+	} else {
+		// This might happen if sigreturn(2) calls are unbalanced with
+		// respect to signal handler entries. This is not expected so
+		// don't bother to do anything fancy with the floating point
+		// state.
+		log.Warningf("sigreturn unable to restore application fpstate")
+	}
+
+	return uc.Sigset, uc.Stack, nil
 }

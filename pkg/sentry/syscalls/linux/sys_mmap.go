@@ -75,7 +75,7 @@ func Mmap(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallC
 	}
 	defer func() {
 		if opts.MappingIdentity != nil {
-			opts.MappingIdentity.DecRef()
+			opts.MappingIdentity.DecRef(t)
 		}
 	}()
 
@@ -85,7 +85,7 @@ func Mmap(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.SyscallC
 		if file == nil {
 			return 0, nil, syserror.EBADF
 		}
-		defer file.DecRef()
+		defer file.DecRef(t)
 
 		flags := file.Flags()
 		// mmap unconditionally requires that the FD is readable.
@@ -239,7 +239,7 @@ func Mincore(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Sysca
 		return 0, nil, syserror.ENOMEM
 	}
 	resident := bytes.Repeat([]byte{1}, int(mapped/usermem.PageSize))
-	_, err := t.CopyOut(vec, resident)
+	_, err := t.CopyOutBytes(vec, resident)
 	return 0, nil, err
 }
 
@@ -267,7 +267,7 @@ func Msync(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 	})
 	// MSync calls fsync, the same interrupt conversion rules apply, see
 	// mm/msync.c, fsync POSIX.1-2008.
-	return 0, nil, syserror.ConvertIntr(err, kernel.ERESTARTSYS)
+	return 0, nil, syserror.ConvertIntr(err, syserror.ERESTARTSYS)
 }
 
 // Mlock implements linux syscall mlock(2).

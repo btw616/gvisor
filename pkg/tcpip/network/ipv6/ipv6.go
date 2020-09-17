@@ -28,7 +28,6 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
 	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/tcpip/network/fragmentation"
-	"gvisor.dev/gvisor/pkg/tcpip/network/hash"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 )
 
@@ -47,13 +46,12 @@ const (
 
 type endpoint struct {
 	nicID         tcpip.NICID
-	id            stack.NetworkEndpointID
-	prefixLen     int
 	linkEP        stack.LinkEndpoint
 	linkAddrCache stack.LinkAddressCache
+	nud           stack.NUDHandler
 	dispatcher    stack.TransportDispatcher
-	fragmentation *fragmentation.Fragmentation
 	protocol      *protocol
+	stack         *stack.Stack
 }
 
 // DefaultTTL is the default hop limit for this endpoint.
@@ -70,16 +68,6 @@ func (e *endpoint) MTU() uint32 {
 // NICID returns the ID of the NIC this endpoint belongs to.
 func (e *endpoint) NICID() tcpip.NICID {
 	return e.nicID
-}
-
-// ID returns the ipv6 endpoint ID.
-func (e *endpoint) ID() *stack.NetworkEndpointID {
-	return &e.id
-}
-
-// PrefixLen returns the ipv6 endpoint subnet prefix length in bits.
-func (e *endpoint) PrefixLen() int {
-	return e.prefixLen
 }
 
 // Capabilities implements stack.NetworkEndpoint.Capabilities.
@@ -101,9 +89,9 @@ func (e *endpoint) GSOMaxSize() uint32 {
 	return 0
 }
 
-func (e *endpoint) addIPHeader(r *stack.Route, hdr *buffer.Prependable, payloadSize int, params stack.NetworkHeaderParams) header.IPv6 {
-	length := uint16(hdr.UsedLength() + payloadSize)
-	ip := header.IPv6(hdr.Prepend(header.IPv6MinimumSize))
+func (e *endpoint) addIPHeader(r *stack.Route, pkt *stack.PacketBuffer, params stack.NetworkHeaderParams) {
+	length := uint16(pkt.Size())
+	ip := header.IPv6(pkt.NetworkHeader().Push(header.IPv6MinimumSize))
 	ip.Encode(&header.IPv6Fields{
 		PayloadLength: length,
 		NextHeader:    uint8(params.Protocol),
@@ -112,25 +100,20 @@ func (e *endpoint) addIPHeader(r *stack.Route, hdr *buffer.Prependable, payloadS
 		SrcAddr:       r.LocalAddress,
 		DstAddr:       r.RemoteAddress,
 	})
-	return ip
+	pkt.NetworkProtocolNumber = header.IPv6ProtocolNumber
 }
 
 // WritePacket writes a packet to the given destination address and protocol.
-func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.NetworkHeaderParams, pkt stack.PacketBuffer) *tcpip.Error {
-	ip := e.addIPHeader(r, &pkt.Header, pkt.Data.Size(), params)
-	pkt.NetworkHeader = buffer.View(ip)
+func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.NetworkHeaderParams, pkt *stack.PacketBuffer) *tcpip.Error {
+	e.addIPHeader(r, pkt, params)
 
 	if r.Loop&stack.PacketLoop != 0 {
-		// The inbound path expects the network header to still be in
-		// the PacketBuffer's Data field.
-		views := make([]buffer.View, 1, 1+len(pkt.Data.Views()))
-		views[0] = pkt.Header.View()
-		views = append(views, pkt.Data.Views()...)
 		loopedR := r.MakeLoopedRoute()
 
-		e.HandlePacket(&loopedR, stack.PacketBuffer{
-			Data: buffer.NewVectorisedView(len(views[0])+pkt.Data.Size(), views),
-		})
+		e.HandlePacket(&loopedR, stack.NewPacketBuffer(stack.PacketBufferOptions{
+			// The inbound path expects an unparsed packet.
+			Data: buffer.NewVectorisedView(pkt.Size(), pkt.Views()),
+		}))
 
 		loopedR.Release()
 	}
@@ -143,19 +126,16 @@ func (e *endpoint) WritePacket(r *stack.Route, gso *stack.GSO, params stack.Netw
 }
 
 // WritePackets implements stack.LinkEndpoint.WritePackets.
-func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts []stack.PacketBuffer, params stack.NetworkHeaderParams) (int, *tcpip.Error) {
+func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts stack.PacketBufferList, params stack.NetworkHeaderParams) (int, *tcpip.Error) {
 	if r.Loop&stack.PacketLoop != 0 {
 		panic("not implemented")
 	}
 	if r.Loop&stack.PacketOut == 0 {
-		return len(pkts), nil
+		return pkts.Len(), nil
 	}
 
-	for i := range pkts {
-		hdr := &pkts[i].Header
-		size := pkts[i].DataSize
-		ip := e.addIPHeader(r, hdr, size, params)
-		pkts[i].NetworkHeader = buffer.View(ip)
+	for pb := pkts.Front(); pb != nil; pb = pb.Next() {
+		e.addIPHeader(r, pb, params)
 	}
 
 	n, err := e.linkEP.WritePackets(r, gso, pkts, ProtocolNumber)
@@ -165,26 +145,29 @@ func (e *endpoint) WritePackets(r *stack.Route, gso *stack.GSO, pkts []stack.Pac
 
 // WriteHeaderIncludedPacker implements stack.NetworkEndpoint. It is not yet
 // supported by IPv6.
-func (*endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt stack.PacketBuffer) *tcpip.Error {
+func (*endpoint) WriteHeaderIncludedPacket(r *stack.Route, pkt *stack.PacketBuffer) *tcpip.Error {
 	// TODO(b/146666412): Support IPv6 header-included packets.
 	return tcpip.ErrNotSupported
 }
 
 // HandlePacket is called by the link layer when new ipv6 packets arrive for
 // this endpoint.
-func (e *endpoint) HandlePacket(r *stack.Route, pkt stack.PacketBuffer) {
-	headerView := pkt.Data.First()
-	h := header.IPv6(headerView)
-	if !h.IsValid(pkt.Data.Size()) {
+func (e *endpoint) HandlePacket(r *stack.Route, pkt *stack.PacketBuffer) {
+	h := header.IPv6(pkt.NetworkHeader().View())
+	if !h.IsValid(pkt.Data.Size() + pkt.NetworkHeader().View().Size() + pkt.TransportHeader().View().Size()) {
 		r.Stats().IP.MalformedPacketsReceived.Increment()
 		return
 	}
 
-	pkt.NetworkHeader = headerView[:header.IPv6MinimumSize]
-	pkt.Data.TrimFront(header.IPv6MinimumSize)
-	pkt.Data.CapLength(int(h.PayloadLength()))
-
-	it := header.MakeIPv6PayloadIterator(header.IPv6ExtensionHeaderIdentifier(h.NextHeader()), pkt.Data)
+	// vv consists of:
+	// - Any IPv6 header bytes after the first 40 (i.e. extensions).
+	// - The transport header, if present.
+	// - Any other payload data.
+	vv := pkt.NetworkHeader().View()[header.IPv6MinimumSize:].ToVectorisedView()
+	vv.AppendView(pkt.TransportHeader().View())
+	vv.Append(pkt.Data)
+	it := header.MakeIPv6PayloadIterator(header.IPv6ExtensionHeaderIdentifier(h.NextHeader()), vv)
+	hasFragmentHeader := false
 
 	for firstHeader := true; ; firstHeader = false {
 		extHdr, done, err := it.Next()
@@ -257,9 +240,9 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt stack.PacketBuffer) {
 			}
 
 		case header.IPv6FragmentExtHdr:
-			fragmentOffset := extHdr.FragmentOffset()
-			more := extHdr.More()
-			if !more && fragmentOffset == 0 {
+			hasFragmentHeader = true
+
+			if extHdr.IsAtomic() {
 				// This fragment extension header indicates that this packet is an
 				// atomic fragment. An atomic fragment is a fragment that contains
 				// all the data required to reassemble a full packet. As per RFC 6946,
@@ -269,7 +252,55 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt stack.PacketBuffer) {
 				continue
 			}
 
-			rawPayload := it.AsRawHeader()
+			// Don't consume the iterator if we have the first fragment because we
+			// will use it to validate that the first fragment holds the upper layer
+			// header.
+			rawPayload := it.AsRawHeader(extHdr.FragmentOffset() != 0 /* consume */)
+
+			if extHdr.FragmentOffset() == 0 {
+				// Check that the iterator ends with a raw payload as the first fragment
+				// should include all headers up to and including any upper layer
+				// headers, as per RFC 8200 section 4.5; only upper layer data
+				// (non-headers) should follow the fragment extension header.
+				var lastHdr header.IPv6PayloadHeader
+
+				for {
+					it, done, err := it.Next()
+					if err != nil {
+						r.Stats().IP.MalformedPacketsReceived.Increment()
+						r.Stats().IP.MalformedPacketsReceived.Increment()
+						return
+					}
+					if done {
+						break
+					}
+
+					lastHdr = it
+				}
+
+				// If the last header is a raw header, then the last portion of the IPv6
+				// payload is not a known IPv6 extension header. Note, this does not
+				// mean that the last portion is an upper layer header or not an
+				// extension header because:
+				//  1) we do not yet support all extension headers
+				//  2) we do not validate the upper layer header before reassembling.
+				//
+				// This check makes sure that a known IPv6 extension header is not
+				// present after the Fragment extension header in a non-initial
+				// fragment.
+				//
+				// TODO(#2196): Support IPv6 Authentication and Encapsulated
+				// Security Payload extension headers.
+				// TODO(#2333): Validate that the upper layer header is valid.
+				switch lastHdr.(type) {
+				case header.IPv6RawPayloadHeader:
+				default:
+					r.Stats().IP.MalformedPacketsReceived.Increment()
+					r.Stats().IP.MalformedFragmentsReceived.Increment()
+					return
+				}
+			}
+
 			fragmentPayloadLen := rawPayload.Buf.Size()
 			if fragmentPayloadLen == 0 {
 				// Drop the packet as it's marked as a fragment but has no payload.
@@ -279,31 +310,45 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt stack.PacketBuffer) {
 			}
 
 			// The packet is a fragment, let's try to reassemble it.
-			start := fragmentOffset * header.IPv6FragmentExtHdrFragmentOffsetBytesPerUnit
-			last := start + uint16(fragmentPayloadLen) - 1
+			start := extHdr.FragmentOffset() * header.IPv6FragmentExtHdrFragmentOffsetBytesPerUnit
 
-			// Drop the packet if the fragmentOffset is incorrect. i.e the
-			// combination of fragmentOffset and pkt.Data.size() causes a
-			// wrap around resulting in last being less than the offset.
-			if last < start {
+			// Drop the fragment if the size of the reassembled payload would exceed
+			// the maximum payload size.
+			if int(start)+fragmentPayloadLen > header.IPv6MaximumPayloadSize {
 				r.Stats().IP.MalformedPacketsReceived.Increment()
 				r.Stats().IP.MalformedFragmentsReceived.Increment()
 				return
 			}
 
-			var ready bool
-			pkt.Data, ready, err = e.fragmentation.Process(hash.IPv6FragmentHash(h, extHdr.ID()), start, last, more, rawPayload.Buf)
+			// Note that pkt doesn't have its transport header set after reassembly,
+			// and won't until DeliverNetworkPacket sets it.
+			data, proto, ready, err := e.protocol.fragmentation.Process(
+				// IPv6 ignores the Protocol field since the ID only needs to be unique
+				// across source-destination pairs, as per RFC 8200 section 4.5.
+				fragmentation.FragmentID{
+					Source:      h.SourceAddress(),
+					Destination: h.DestinationAddress(),
+					ID:          extHdr.ID(),
+				},
+				start,
+				start+uint16(fragmentPayloadLen)-1,
+				extHdr.More(),
+				uint8(rawPayload.Identifier),
+				rawPayload.Buf,
+			)
 			if err != nil {
 				r.Stats().IP.MalformedPacketsReceived.Increment()
 				r.Stats().IP.MalformedFragmentsReceived.Increment()
 				return
 			}
+			pkt.Data = data
 
 			if ready {
 				// We create a new iterator with the reassembled packet because we could
 				// have more extension headers in the reassembled payload, as per RFC
-				// 8200 section 4.5.
-				it = header.MakeIPv6PayloadIterator(rawPayload.Identifier, pkt.Data)
+				// 8200 section 4.5. We also use the NextHeader value from the first
+				// fragment.
+				it = header.MakeIPv6PayloadIterator(header.IPv6ExtensionHeaderIdentifier(proto), pkt.Data)
 			}
 
 		case header.IPv6DestinationOptionsExtHdr:
@@ -341,10 +386,17 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt stack.PacketBuffer) {
 		case header.IPv6RawPayloadHeader:
 			// If the last header in the payload isn't a known IPv6 extension header,
 			// handle it as if it is transport layer data.
+
+			// For unfragmented packets, extHdr still contains the transport header.
+			// Get rid of it.
+			//
+			// For reassembled fragments, pkt.TransportHeader is unset, so this is a
+			// no-op and pkt.Data begins with the transport header.
+			extHdr.Buf.TrimFront(pkt.TransportHeader().View().Size())
 			pkt.Data = extHdr.Buf
 
 			if p := tcpip.TransportProtocolNumber(extHdr.Identifier); p == header.ICMPv6ProtocolNumber {
-				e.handleICMP(r, headerView, pkt)
+				e.handleICMP(r, pkt, hasFragmentHeader)
 			} else {
 				r.Stats().IP.PacketsDelivered.Increment()
 				// TODO(b/152019344): Send an ICMPv6 Parameter Problem, Code 1 error
@@ -367,11 +419,17 @@ func (e *endpoint) HandlePacket(r *stack.Route, pkt stack.PacketBuffer) {
 // Close cleans up resources associated with the endpoint.
 func (*endpoint) Close() {}
 
+// NetworkProtocolNumber implements stack.NetworkEndpoint.NetworkProtocolNumber.
+func (e *endpoint) NetworkProtocolNumber() tcpip.NetworkProtocolNumber {
+	return e.protocol.Number()
+}
+
 type protocol struct {
 	// defaultTTL is the current default TTL for the protocol. Only the
 	// uint8 portion of it is meaningful and it must be accessed
 	// atomically.
-	defaultTTL uint32
+	defaultTTL    uint32
+	fragmentation *fragmentation.Fragmentation
 }
 
 // Number returns the ipv6 protocol number.
@@ -396,24 +454,23 @@ func (*protocol) ParseAddresses(v buffer.View) (src, dst tcpip.Address) {
 }
 
 // NewEndpoint creates a new ipv6 endpoint.
-func (p *protocol) NewEndpoint(nicID tcpip.NICID, addrWithPrefix tcpip.AddressWithPrefix, linkAddrCache stack.LinkAddressCache, dispatcher stack.TransportDispatcher, linkEP stack.LinkEndpoint, st *stack.Stack) (stack.NetworkEndpoint, *tcpip.Error) {
+func (p *protocol) NewEndpoint(nicID tcpip.NICID, linkAddrCache stack.LinkAddressCache, nud stack.NUDHandler, dispatcher stack.TransportDispatcher, linkEP stack.LinkEndpoint, st *stack.Stack) stack.NetworkEndpoint {
 	return &endpoint{
 		nicID:         nicID,
-		id:            stack.NetworkEndpointID{LocalAddress: addrWithPrefix.Address},
-		prefixLen:     addrWithPrefix.PrefixLen,
 		linkEP:        linkEP,
 		linkAddrCache: linkAddrCache,
+		nud:           nud,
 		dispatcher:    dispatcher,
-		fragmentation: fragmentation.NewFragmentation(fragmentation.HighFragThreshold, fragmentation.LowFragThreshold, fragmentation.DefaultReassembleTimeout),
 		protocol:      p,
-	}, nil
+		stack:         st,
+	}
 }
 
 // SetOption implements NetworkProtocol.SetOption.
-func (p *protocol) SetOption(option interface{}) *tcpip.Error {
+func (p *protocol) SetOption(option tcpip.SettableNetworkProtocolOption) *tcpip.Error {
 	switch v := option.(type) {
-	case tcpip.DefaultTTLOption:
-		p.SetDefaultTTL(uint8(v))
+	case *tcpip.DefaultTTLOption:
+		p.SetDefaultTTL(uint8(*v))
 		return nil
 	default:
 		return tcpip.ErrUnknownProtocolOption
@@ -421,7 +478,7 @@ func (p *protocol) SetOption(option interface{}) *tcpip.Error {
 }
 
 // Option implements NetworkProtocol.Option.
-func (p *protocol) Option(option interface{}) *tcpip.Error {
+func (p *protocol) Option(option tcpip.GettableNetworkProtocolOption) *tcpip.Error {
 	switch v := option.(type) {
 	case *tcpip.DefaultTTLOption:
 		*v = tcpip.DefaultTTLOption(p.DefaultTTL())
@@ -447,6 +504,77 @@ func (*protocol) Close() {}
 // Wait implements stack.TransportProtocol.Wait.
 func (*protocol) Wait() {}
 
+// Parse implements stack.TransportProtocol.Parse.
+func (*protocol) Parse(pkt *stack.PacketBuffer) (proto tcpip.TransportProtocolNumber, hasTransportHdr bool, ok bool) {
+	hdr, ok := pkt.Data.PullUp(header.IPv6MinimumSize)
+	if !ok {
+		return 0, false, false
+	}
+	ipHdr := header.IPv6(hdr)
+
+	// dataClone consists of:
+	// - Any IPv6 header bytes after the first 40 (i.e. extensions).
+	// - The transport header, if present.
+	// - Any other payload data.
+	views := [8]buffer.View{}
+	dataClone := pkt.Data.Clone(views[:])
+	dataClone.TrimFront(header.IPv6MinimumSize)
+	it := header.MakeIPv6PayloadIterator(header.IPv6ExtensionHeaderIdentifier(ipHdr.NextHeader()), dataClone)
+
+	// Iterate over the IPv6 extensions to find their length.
+	//
+	// Parsing occurs again in HandlePacket because we don't track the
+	// extensions in PacketBuffer. Unfortunately, that means HandlePacket
+	// has to do the parsing work again.
+	var nextHdr tcpip.TransportProtocolNumber
+	foundNext := true
+	extensionsSize := 0
+traverseExtensions:
+	for extHdr, done, err := it.Next(); ; extHdr, done, err = it.Next() {
+		if err != nil {
+			break
+		}
+		// If we exhaust the extension list, the entire packet is the IPv6 header
+		// and (possibly) extensions.
+		if done {
+			extensionsSize = dataClone.Size()
+			foundNext = false
+			break
+		}
+
+		switch extHdr := extHdr.(type) {
+		case header.IPv6FragmentExtHdr:
+			// If this is an atomic fragment, we don't have to treat it specially.
+			if !extHdr.More() && extHdr.FragmentOffset() == 0 {
+				continue
+			}
+			// This is a non-atomic fragment and has to be re-assembled before we can
+			// examine the payload for a transport header.
+			foundNext = false
+
+		case header.IPv6RawPayloadHeader:
+			// We've found the payload after any extensions.
+			extensionsSize = dataClone.Size() - extHdr.Buf.Size()
+			nextHdr = tcpip.TransportProtocolNumber(extHdr.Identifier)
+			break traverseExtensions
+
+		default:
+			// Any other extension is a no-op, keep looping until we find the payload.
+		}
+	}
+
+	// Put the IPv6 header with extensions in pkt.NetworkHeader().
+	hdr, ok = pkt.NetworkHeader().Consume(header.IPv6MinimumSize + extensionsSize)
+	if !ok {
+		panic(fmt.Sprintf("pkt.Data should have at least %d bytes, but only has %d.", header.IPv6MinimumSize+extensionsSize, pkt.Data.Size()))
+	}
+	ipHdr = header.IPv6(hdr)
+	pkt.Data.CapLength(int(ipHdr.PayloadLength()))
+	pkt.NetworkProtocolNumber = header.IPv6ProtocolNumber
+
+	return nextHdr, foundNext, true
+}
+
 // calculateMTU calculates the network-layer payload MTU based on the link-layer
 // payload mtu.
 func calculateMTU(mtu uint32) uint32 {
@@ -459,5 +587,8 @@ func calculateMTU(mtu uint32) uint32 {
 
 // NewProtocol returns an IPv6 network protocol.
 func NewProtocol() stack.NetworkProtocol {
-	return &protocol{defaultTTL: DefaultTTL}
+	return &protocol{
+		defaultTTL:    DefaultTTL,
+		fragmentation: fragmentation.NewFragmentation(header.IPv6FragmentExtHdrFragmentOffsetBytesPerUnit, fragmentation.HighFragThreshold, fragmentation.LowFragThreshold, fragmentation.DefaultReassembleTimeout),
+	}
 }

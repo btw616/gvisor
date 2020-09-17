@@ -273,7 +273,7 @@ func (i *inodeFileState) recreateReadHandles(ctx context.Context, writer *handle
 	// operations on the old will see the new data. Then, make the new handle take
 	// ownereship of the old FD and mark the old readHandle to not close the FD
 	// when done.
-	if err := syscall.Dup3(h.Host.FD(), i.readHandles.Host.FD(), 0); err != nil {
+	if err := syscall.Dup3(h.Host.FD(), i.readHandles.Host.FD(), syscall.O_CLOEXEC); err != nil {
 		return err
 	}
 
@@ -441,8 +441,9 @@ func (i *inodeOperations) Release(ctx context.Context) {
 	// asynchronously.
 	//
 	// We use AsyncWithContext to avoid needing to allocate an extra
-	// anonymous function on the heap.
-	fs.AsyncWithContext(ctx, i.fileState.Release)
+	// anonymous function on the heap. We must use background context
+	// because the async work cannot happen on the task context.
+	fs.AsyncWithContext(context.Background(), i.fileState.Release)
 }
 
 // Mappable implements fs.InodeOperations.Mappable.
@@ -640,7 +641,7 @@ func (i *inodeOperations) Allocate(ctx context.Context, inode *fs.Inode, offset,
 
 // WriteOut implements fs.InodeOperations.WriteOut.
 func (i *inodeOperations) WriteOut(ctx context.Context, inode *fs.Inode) error {
-	if !i.session().cachePolicy.cacheUAttrs(inode) {
+	if inode.MountSource.Flags.ReadOnly || !i.session().cachePolicy.cacheUAttrs(inode) {
 		return nil
 	}
 
@@ -710,13 +711,10 @@ func init() {
 }
 
 // AddLink implements InodeOperations.AddLink, but is currently a noop.
-// FIXME(b/63117438): Remove this from InodeOperations altogether.
 func (*inodeOperations) AddLink() {}
 
 // DropLink implements InodeOperations.DropLink, but is currently a noop.
-// FIXME(b/63117438): Remove this from InodeOperations altogether.
 func (*inodeOperations) DropLink() {}
 
 // NotifyStatusChange implements fs.InodeOperations.NotifyStatusChange.
-// FIXME(b/63117438): Remove this from InodeOperations altogether.
 func (i *inodeOperations) NotifyStatusChange(ctx context.Context) {}

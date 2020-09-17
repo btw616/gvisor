@@ -17,6 +17,7 @@ package boot
 import (
 	"fmt"
 	"net"
+	"runtime"
 	"strings"
 	"syscall"
 
@@ -24,12 +25,15 @@ import (
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/link/fdbased"
 	"gvisor.dev/gvisor/pkg/tcpip/link/loopback"
+	"gvisor.dev/gvisor/pkg/tcpip/link/packetsocket"
+	"gvisor.dev/gvisor/pkg/tcpip/link/qdisc/fifo"
 	"gvisor.dev/gvisor/pkg/tcpip/link/sniffer"
 	"gvisor.dev/gvisor/pkg/tcpip/network/arp"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv4"
 	"gvisor.dev/gvisor/pkg/tcpip/network/ipv6"
 	"gvisor.dev/gvisor/pkg/tcpip/stack"
 	"gvisor.dev/gvisor/pkg/urpc"
+	"gvisor.dev/gvisor/runsc/config"
 )
 
 var (
@@ -83,7 +87,10 @@ type FDBasedLink struct {
 	Routes             []Route
 	GSOMaxSize         uint32
 	SoftwareGSOEnabled bool
+	TXChecksumOffload  bool
+	RXChecksumOffload  bool
 	LinkAddress        net.HardwareAddr
+	QDisc              config.QueueingDiscipline
 
 	// NumChannels controls how many underlying FD's are to be used to
 	// create this endpoint.
@@ -185,6 +192,8 @@ func (n *Network) CreateLinksAndRoutes(args *CreateLinksAndRoutesArgs, _ *struct
 		}
 
 		mac := tcpip.LinkAddress(link.LinkAddress)
+		log.Infof("gso max size is: %d", link.GSOMaxSize)
+
 		linkEP, err := fdbased.New(&fdbased.Options{
 			FDs:                FDs,
 			MTU:                uint32(link.MTU),
@@ -193,11 +202,22 @@ func (n *Network) CreateLinksAndRoutes(args *CreateLinksAndRoutesArgs, _ *struct
 			PacketDispatchMode: fdbased.RecvMMsg,
 			GSOMaxSize:         link.GSOMaxSize,
 			SoftwareGSOEnabled: link.SoftwareGSOEnabled,
-			RXChecksumOffload:  true,
+			TXChecksumOffload:  link.TXChecksumOffload,
+			RXChecksumOffload:  link.RXChecksumOffload,
 		})
 		if err != nil {
 			return err
 		}
+
+		switch link.QDisc {
+		case config.QDiscNone:
+		case config.QDiscFIFO:
+			log.Infof("Enabling FIFO QDisc on %q", link.Name)
+			linkEP = fifo.New(linkEP, runtime.GOMAXPROCS(0), 1000)
+		}
+
+		// Enable support for AF_PACKET sockets to receive outgoing packets.
+		linkEP = packetsocket.New(linkEP)
 
 		log.Infof("Enabling interface %q with id %d on addresses %+v (%v) w/ %d channels", link.Name, nicID, link.Addresses, mac, link.NumChannels)
 		if err := n.createNICWithAddrs(nicID, link.Name, linkEP, link.Addresses); err != nil {

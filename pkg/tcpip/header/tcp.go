@@ -66,6 +66,14 @@ const (
 	TCPOptionSACK          = 5
 )
 
+// Option Lengths.
+const (
+	TCPOptionMSSLength           = 4
+	TCPOptionTSLength            = 10
+	TCPOptionWSLength            = 3
+	TCPOptionSackPermittedLength = 2
+)
+
 // TCPFields contains the fields of a TCP packet. It is used to describe the
 // fields of a packet that needs to be encoded.
 type TCPFields struct {
@@ -494,14 +502,11 @@ func ParseTCPOptions(b []byte) TCPOptions {
 // returns without encoding anything. It returns the number of bytes written to
 // the provided buffer.
 func EncodeMSSOption(mss uint32, b []byte) int {
-	// mssOptionSize is the number of bytes in a valid MSS option.
-	const mssOptionSize = 4
-
-	if len(b) < mssOptionSize {
+	if len(b) < TCPOptionMSSLength {
 		return 0
 	}
-	b[0], b[1], b[2], b[3] = TCPOptionMSS, mssOptionSize, byte(mss>>8), byte(mss)
-	return mssOptionSize
+	b[0], b[1], b[2], b[3] = TCPOptionMSS, TCPOptionMSSLength, byte(mss>>8), byte(mss)
+	return TCPOptionMSSLength
 }
 
 // EncodeWSOption encodes the WS TCP option with the WS value in the
@@ -509,10 +514,10 @@ func EncodeMSSOption(mss uint32, b []byte) int {
 // returns without encoding anything. It returns the number of bytes written to
 // the provided buffer.
 func EncodeWSOption(ws int, b []byte) int {
-	if len(b) < 3 {
+	if len(b) < TCPOptionWSLength {
 		return 0
 	}
-	b[0], b[1], b[2] = TCPOptionWS, 3, uint8(ws)
+	b[0], b[1], b[2] = TCPOptionWS, TCPOptionWSLength, uint8(ws)
 	return int(b[1])
 }
 
@@ -521,10 +526,10 @@ func EncodeWSOption(ws int, b []byte) int {
 // just returns without encoding anything. It returns the number of bytes
 // written to the provided buffer.
 func EncodeTSOption(tsVal, tsEcr uint32, b []byte) int {
-	if len(b) < 10 {
+	if len(b) < TCPOptionTSLength {
 		return 0
 	}
-	b[0], b[1] = TCPOptionTS, 10
+	b[0], b[1] = TCPOptionTS, TCPOptionTSLength
 	binary.BigEndian.PutUint32(b[2:], tsVal)
 	binary.BigEndian.PutUint32(b[6:], tsEcr)
 	return int(b[1])
@@ -535,11 +540,11 @@ func EncodeTSOption(tsVal, tsEcr uint32, b []byte) int {
 // encoding anything. It returns the number of bytes written to the provided
 // buffer.
 func EncodeSACKPermittedOption(b []byte) int {
-	if len(b) < 2 {
+	if len(b) < TCPOptionSackPermittedLength {
 		return 0
 	}
 
-	b[0], b[1] = TCPOptionSACKPermitted, 2
+	b[0], b[1] = TCPOptionSACKPermitted, TCPOptionSackPermittedLength
 	return int(b[1])
 }
 
@@ -593,4 +598,24 @@ func AddTCPOptionPadding(options []byte, offset int) int {
 		options[i] = TCPOptionNOP
 	}
 	return paddingToAdd
+}
+
+// Acceptable checks if a segment that starts at segSeq and has length segLen is
+// "acceptable" for arriving in a receive window that starts at rcvNxt and ends
+// before rcvAcc, according to the table on page 26 and 69 of RFC 793.
+func Acceptable(segSeq seqnum.Value, segLen seqnum.Size, rcvNxt, rcvAcc seqnum.Value) bool {
+	if rcvNxt == rcvAcc {
+		return segLen == 0 && segSeq == rcvNxt
+	}
+	if segLen == 0 {
+		// rcvWnd is incremented by 1 because that is Linux's behavior despite the
+		// RFC.
+		return segSeq.InRange(rcvNxt, rcvAcc.Add(1))
+	}
+	// Page 70 of RFC 793 allows packets that can be made "acceptable" by trimming
+	// the payload, so we'll accept any payload that overlaps the receieve window.
+	// segSeq < rcvAcc is more correct according to RFC, however, Linux does it
+	// differently, it uses segSeq <= rcvAcc, we'd want to keep the same behavior
+	// as Linux.
+	return rcvNxt.LessThan(segSeq.Add(segLen)) && segSeq.LessThanEq(rcvAcc)
 }

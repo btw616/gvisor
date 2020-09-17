@@ -245,7 +245,7 @@ type Clock interface {
 type WallRateClock struct{}
 
 // WallTimeUntil implements Clock.WallTimeUntil.
-func (WallRateClock) WallTimeUntil(t, now Time) time.Duration {
+func (*WallRateClock) WallTimeUntil(t, now Time) time.Duration {
 	return t.Sub(now)
 }
 
@@ -254,16 +254,16 @@ func (WallRateClock) WallTimeUntil(t, now Time) time.Duration {
 type NoClockEvents struct{}
 
 // Readiness implements waiter.Waitable.Readiness.
-func (NoClockEvents) Readiness(mask waiter.EventMask) waiter.EventMask {
+func (*NoClockEvents) Readiness(mask waiter.EventMask) waiter.EventMask {
 	return 0
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (NoClockEvents) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
+func (*NoClockEvents) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
-func (NoClockEvents) EventUnregister(e *waiter.Entry) {
+func (*NoClockEvents) EventUnregister(e *waiter.Entry) {
 }
 
 // ClockEventsQueue implements waiter.Waitable by wrapping waiter.Queue and
@@ -273,7 +273,7 @@ type ClockEventsQueue struct {
 }
 
 // Readiness implements waiter.Waitable.Readiness.
-func (ClockEventsQueue) Readiness(mask waiter.EventMask) waiter.EventMask {
+func (*ClockEventsQueue) Readiness(mask waiter.EventMask) waiter.EventMask {
 	return 0
 }
 
@@ -616,8 +616,10 @@ func (t *Timer) Swap(s Setting) (Time, Setting) {
 // Timer's Clock) at which the Setting was changed. Setting s.Enabled to true
 // starts the timer, while setting s.Enabled to false stops it.
 //
-// Preconditions: The Timer must not be paused. f cannot call any Timer methods
-// since it is called with the Timer mutex locked.
+// Preconditions:
+// * The Timer must not be paused.
+// * f cannot call any Timer methods since it is called with the Timer mutex
+//   locked.
 func (t *Timer) SwapAnd(s Setting, f func()) (Time, Setting) {
 	now := t.clock.Now()
 	t.mu.Lock()

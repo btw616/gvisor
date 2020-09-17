@@ -17,13 +17,17 @@
 package kvm
 
 import (
-	"syscall"
+	"gvisor.dev/gvisor/pkg/sentry/arch"
+	"gvisor.dev/gvisor/pkg/sentry/platform/ring0"
 )
 
 type kvmOneReg struct {
 	id   uint64
 	addr uint64
 }
+
+// arm64HypercallMMIOBase is MMIO base address used to dispatch hypercalls.
+var arm64HypercallMMIOBase uintptr
 
 const KVM_NR_SPSR = 5
 
@@ -35,17 +39,29 @@ type userFpsimdState struct {
 }
 
 type userRegs struct {
-	Regs    syscall.PtraceRegs
+	Regs    arch.Registers
 	sp_el1  uint64
 	elr_el1 uint64
 	spsr    [KVM_NR_SPSR]uint64
 	fpRegs  userFpsimdState
 }
 
+type exception struct {
+	sErrPending uint8
+	sErrHasEsr  uint8
+	pad         [6]uint8
+	sErrEsr     uint64
+}
+
+type kvmVcpuEvents struct {
+	exception
+	rsvd [12]uint32
+}
+
 // updateGlobalOnce does global initialization. It has to be called only once.
 func updateGlobalOnce(fd int) error {
 	physicalInit()
 	err := updateSystemValues(int(fd))
-	updateVectorTable()
+	ring0.Init()
 	return err
 }

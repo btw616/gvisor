@@ -105,24 +105,11 @@ type handshake struct {
 }
 
 func newHandshake(ep *endpoint, rcvWnd seqnum.Size) handshake {
-	rcvWndScale := ep.rcvWndScaleForHandshake()
-
-	// Round-down the rcvWnd to a multiple of wndScale. This ensures that the
-	// window offered in SYN won't be reduced due to the loss of precision if
-	// window scaling is enabled after the handshake.
-	rcvWnd = (rcvWnd >> uint8(rcvWndScale)) << uint8(rcvWndScale)
-
-	// Ensure we can always accept at least 1 byte if the scale specified
-	// was too high for the provided rcvWnd.
-	if rcvWnd == 0 {
-		rcvWnd = 1
-	}
-
 	h := handshake{
 		ep:          ep,
 		active:      true,
 		rcvWnd:      rcvWnd,
-		rcvWndScale: int(rcvWndScale),
+		rcvWndScale: ep.rcvWndScaleForHandshake(),
 	}
 	h.resetState()
 	return h
@@ -503,6 +490,9 @@ func (h *handshake) resolveRoute() *tcpip.Error {
 				<-h.ep.undrain
 				h.ep.mu.Lock()
 			}
+			if n&notifyError != 0 {
+				return h.ep.LastError()
+			}
 		}
 
 		// Wait for notification.
@@ -522,9 +512,7 @@ func (h *handshake) execute() *tcpip.Error {
 	// Initialize the resend timer.
 	resendWaker := sleep.Waker{}
 	timeOut := time.Duration(time.Second)
-	rt := time.AfterFunc(timeOut, func() {
-		resendWaker.Assert()
-	})
+	rt := time.AfterFunc(timeOut, resendWaker.Assert)
 	defer rt.Stop()
 
 	// Set up the wakers.
@@ -534,7 +522,7 @@ func (h *handshake) execute() *tcpip.Error {
 	s.AddWaker(&h.ep.newSegmentWaker, wakerForNewSegment)
 	defer s.Done()
 
-	var sackEnabled SACKEnabled
+	var sackEnabled tcpip.TCPSACKEnabled
 	if err := h.ep.stack.TransportProtocolOption(ProtocolNumber, &sackEnabled); err != nil {
 		// If stack returned an error when checking for SACKEnabled
 		// status then just default to switching off SACK negotiation.
@@ -630,6 +618,9 @@ func (h *handshake) execute() *tcpip.Error {
 				h.ep.mu.Unlock()
 				<-h.ep.undrain
 				h.ep.mu.Lock()
+			}
+			if n&notifyError != 0 {
+				return h.ep.LastError()
 			}
 
 		case wakerForNewSegment:
@@ -755,12 +746,7 @@ func (e *endpoint) sendTCP(r *stack.Route, tf tcpFields, data buffer.VectorisedV
 
 func buildTCPHdr(r *stack.Route, tf tcpFields, pkt *stack.PacketBuffer, gso *stack.GSO) {
 	optLen := len(tf.opts)
-	hdr := &pkt.Header
-	packetSize := pkt.DataSize
-	off := pkt.DataOffset
-	// Initialize the header.
-	tcp := header.TCP(hdr.Prepend(header.TCPMinimumSize + optLen))
-	pkt.TransportHeader = buffer.View(tcp)
+	tcp := header.TCP(pkt.TransportHeader().Push(header.TCPMinimumSize + optLen))
 	tcp.Encode(&header.TCPFields{
 		SrcPort:    tf.id.LocalPort,
 		DstPort:    tf.id.RemotePort,
@@ -772,8 +758,7 @@ func buildTCPHdr(r *stack.Route, tf tcpFields, pkt *stack.PacketBuffer, gso *sta
 	})
 	copy(tcp[header.TCPMinimumSize:], tf.opts)
 
-	length := uint16(hdr.UsedLength() + packetSize)
-	xsum := r.PseudoHeaderChecksum(ProtocolNumber, length)
+	xsum := r.PseudoHeaderChecksum(ProtocolNumber, uint16(pkt.Size()))
 	// Only calculate the checksum if offloading isn't supported.
 	if gso != nil && gso.NeedsCsum {
 		// This is called CHECKSUM_PARTIAL in the Linux kernel. We
@@ -782,12 +767,18 @@ func buildTCPHdr(r *stack.Route, tf tcpFields, pkt *stack.PacketBuffer, gso *sta
 		// header and data and get the right sum of the TCP packet.
 		tcp.SetChecksum(xsum)
 	} else if r.Capabilities()&stack.CapabilityTXChecksumOffload == 0 {
-		xsum = header.ChecksumVVWithOffset(pkt.Data, xsum, off, packetSize)
+		xsum = header.ChecksumVV(pkt.Data, xsum)
 		tcp.SetChecksum(^tcp.CalculateChecksum(xsum))
 	}
 }
 
 func sendTCPBatch(r *stack.Route, tf tcpFields, data buffer.VectorisedView, gso *stack.GSO, owner tcpip.PacketOwner) *tcpip.Error {
+	// We need to shallow clone the VectorisedView here as ReadToView will
+	// split the VectorisedView and Trim underlying views as it splits. Not
+	// doing the clone here will cause the underlying views of data itself
+	// to be altered.
+	data = data.Clone(nil)
+
 	optLen := len(tf.opts)
 	if tf.rcvWnd > 0xffff {
 		tf.rcvWnd = 0xffff
@@ -796,31 +787,29 @@ func sendTCPBatch(r *stack.Route, tf tcpFields, data buffer.VectorisedView, gso 
 	mss := int(gso.MSS)
 	n := (data.Size() + mss - 1) / mss
 
-	// Allocate one big slice for all the headers.
-	hdrSize := header.TCPMinimumSize + int(r.MaxHeaderLength()) + optLen
-	buf := make([]byte, n*hdrSize)
-	pkts := make([]stack.PacketBuffer, n)
-	for i := range pkts {
-		pkts[i].Header = buffer.NewEmptyPrependableFromView(buf[i*hdrSize:][:hdrSize])
-	}
-
 	size := data.Size()
-	off := 0
+	hdrSize := header.TCPMinimumSize + int(r.MaxHeaderLength()) + optLen
+	var pkts stack.PacketBufferList
 	for i := 0; i < n; i++ {
 		packetSize := mss
 		if packetSize > size {
 			packetSize = size
 		}
 		size -= packetSize
-		pkts[i].DataOffset = off
-		pkts[i].DataSize = packetSize
-		pkts[i].Data = data
-		pkts[i].Hash = tf.txHash
-		pkts[i].Owner = owner
-		buildTCPHdr(r, tf, &pkts[i], gso)
-		off += packetSize
+		pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+			ReserveHeaderBytes: hdrSize,
+		})
+		pkt.Hash = tf.txHash
+		pkt.Owner = owner
+		pkt.EgressRoute = r
+		pkt.GSOOptions = gso
+		pkt.NetworkProtocolNumber = r.NetworkProtocolNumber()
+		data.ReadToVV(&pkt.Data, packetSize)
+		buildTCPHdr(r, tf, pkt, gso)
 		tf.seq = tf.seq.Add(seqnum.Size(packetSize))
+		pkts.PushBack(pkt)
 	}
+
 	if tf.ttl == 0 {
 		tf.ttl = r.DefaultTTL()
 	}
@@ -844,15 +833,13 @@ func sendTCP(r *stack.Route, tf tcpFields, data buffer.VectorisedView, gso *stac
 		return sendTCPBatch(r, tf, data, gso, owner)
 	}
 
-	pkt := stack.PacketBuffer{
-		Header:     buffer.NewPrependable(header.TCPMinimumSize + int(r.MaxHeaderLength()) + optLen),
-		DataOffset: 0,
-		DataSize:   data.Size(),
-		Data:       data,
-		Hash:       tf.txHash,
-		Owner:      owner,
-	}
-	buildTCPHdr(r, tf, &pkt, gso)
+	pkt := stack.NewPacketBuffer(stack.PacketBufferOptions{
+		ReserveHeaderBytes: header.TCPMinimumSize + int(r.MaxHeaderLength()) + optLen,
+		Data:               data,
+	})
+	pkt.Hash = tf.txHash
+	pkt.Owner = owner
+	buildTCPHdr(r, tf, pkt, gso)
 
 	if tf.ttl == 0 {
 		tf.ttl = r.DefaultTTL()
@@ -1008,24 +995,22 @@ func (e *endpoint) completeWorkerLocked() {
 
 // transitionToStateEstablisedLocked transitions a given endpoint
 // to an established state using the handshake parameters provided.
-// It also initializes sender/receiver if required.
+// It also initializes sender/receiver.
 func (e *endpoint) transitionToStateEstablishedLocked(h *handshake) {
-	if e.snd == nil {
-		// Transfer handshake state to TCP connection. We disable
-		// receive window scaling if the peer doesn't support it
-		// (indicated by a negative send window scale).
-		e.snd = newSender(e, h.iss, h.ackNum-1, h.sndWnd, h.mss, h.sndWndScale)
-	}
-	if e.rcv == nil {
-		rcvBufSize := seqnum.Size(e.receiveBufferSize())
-		e.rcvListMu.Lock()
-		e.rcv = newReceiver(e, h.ackNum-1, h.rcvWnd, h.effectiveRcvWndScale(), rcvBufSize)
-		// Bootstrap the auto tuning algorithm. Starting at zero will
-		// result in a really large receive window after the first auto
-		// tuning adjustment.
-		e.rcvAutoParams.prevCopied = int(h.rcvWnd)
-		e.rcvListMu.Unlock()
-	}
+	// Transfer handshake state to TCP connection. We disable
+	// receive window scaling if the peer doesn't support it
+	// (indicated by a negative send window scale).
+	e.snd = newSender(e, h.iss, h.ackNum-1, h.sndWnd, h.mss, h.sndWndScale)
+
+	rcvBufSize := seqnum.Size(e.receiveBufferSize())
+	e.rcvListMu.Lock()
+	e.rcv = newReceiver(e, h.ackNum-1, h.rcvWnd, h.effectiveRcvWndScale(), rcvBufSize)
+	// Bootstrap the auto tuning algorithm. Starting at zero will
+	// result in a really large receive window after the first auto
+	// tuning adjustment.
+	e.rcvAutoParams.prevCopied = int(h.rcvWnd)
+	e.rcvListMu.Unlock()
+
 	e.setEndpointState(StateEstablished)
 }
 
@@ -1035,14 +1020,19 @@ func (e *endpoint) transitionToStateEstablishedLocked(h *handshake) {
 // delivered to this endpoint from the demuxer when the endpoint
 // is transitioned to StateClose.
 func (e *endpoint) transitionToStateCloseLocked() {
-	if e.EndpointState() == StateClose {
+	s := e.EndpointState()
+	if s == StateClose {
 		return
 	}
+
+	if s.connected() {
+		e.stack.Stats().TCP.CurrentConnected.Decrement()
+		e.stack.Stats().TCP.EstablishedClosed.Increment()
+	}
+
 	// Mark the endpoint as fully closed for reads/writes.
 	e.cleanupLocked()
 	e.setEndpointState(StateClose)
-	e.stack.Stats().TCP.CurrentConnected.Decrement()
-	e.stack.Stats().TCP.EstablishedClosed.Increment()
 }
 
 // tryDeliverSegmentFromClosedEndpoint attempts to deliver the parsed
@@ -1056,12 +1046,31 @@ func (e *endpoint) tryDeliverSegmentFromClosedEndpoint(s *segment) {
 		ep = e.stack.FindTransportEndpoint(header.IPv4ProtocolNumber, e.TransProto, e.ID, &s.route)
 	}
 	if ep == nil {
-		replyWithReset(s)
+		replyWithReset(s, stack.DefaultTOS, s.route.DefaultTTL())
 		s.decRef()
 		return
 	}
-	if ep.(*endpoint).enqueueSegment(s) {
-		ep.(*endpoint).newSegmentWaker.Assert()
+
+	if e == ep {
+		panic("current endpoint not removed from demuxer, enqueing segments to itself")
+	}
+
+	if ep := ep.(*endpoint); ep.enqueueSegment(s) {
+		ep.newSegmentWaker.Assert()
+	}
+}
+
+// Drain segment queue from the endpoint and try to re-match the segment to a
+// different endpoint. This is used when the current endpoint is transitioned to
+// StateClose and has been unregistered from the transport demuxer.
+func (e *endpoint) drainClosingSegmentQueue() {
+	for {
+		s := e.segmentQueue.dequeue()
+		if s == nil {
+			break
+		}
+
+		e.tryDeliverSegmentFromClosedEndpoint(s)
 	}
 }
 
@@ -1116,7 +1125,7 @@ func (e *endpoint) handleReset(s *segment) (ok bool, err *tcpip.Error) {
 func (e *endpoint) handleSegments(fastPath bool) *tcpip.Error {
 	checkRequeue := true
 	for i := 0; i < maxSegmentsPerWake; i++ {
-		if e.EndpointState() == StateClose || e.EndpointState() == StateError {
+		if e.EndpointState().closed() {
 			return nil
 		}
 		s := e.segmentQueue.dequeue()
@@ -1153,13 +1162,18 @@ func (e *endpoint) handleSegments(fastPath bool) *tcpip.Error {
 	return nil
 }
 
-// handleSegment handles a given segment and notifies the worker goroutine if
-// if the connection should be terminated.
-func (e *endpoint) handleSegment(s *segment) (cont bool, err *tcpip.Error) {
-	// Invoke the tcp probe if installed.
+func (e *endpoint) probeSegment() {
 	if e.probe != nil {
 		e.probe(e.completeState())
 	}
+}
+
+// handleSegment handles a given segment and notifies the worker goroutine if
+// if the connection should be terminated.
+func (e *endpoint) handleSegment(s *segment) (cont bool, err *tcpip.Error) {
+	// Invoke the tcp probe if installed. The tcp probe function will update
+	// the TCPEndpointState after the segment is processed.
+	defer e.probeSegment()
 
 	if s.flagIsSet(header.TCPFlagRst) {
 		if ok, err := e.handleReset(s); !ok {
@@ -1318,6 +1332,9 @@ func (e *endpoint) protocolMainLoop(handshake bool, wakerInitDone chan<- struct{
 		}
 
 		e.mu.Unlock()
+
+		e.drainClosingSegmentQueue()
+
 		// When the protocol loop exits we should wake up our waiters.
 		e.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.EventIn | waiter.EventOut)
 	}
@@ -1338,6 +1355,7 @@ func (e *endpoint) protocolMainLoop(handshake bool, wakerInitDone chan<- struct{
 			e.setEndpointState(StateError)
 			e.HardError = err
 
+			e.workerCleanup = true
 			// Lock released below.
 			epilogue()
 			return err
@@ -1432,9 +1450,7 @@ func (e *endpoint) protocolMainLoop(handshake bool, wakerInitDone chan<- struct{
 					if e.EndpointState() == StateFinWait2 && e.closed {
 						// The socket has been closed and we are in FIN_WAIT2
 						// so start the FIN_WAIT2 timer.
-						closeTimer = time.AfterFunc(e.tcpLingerTimeout, func() {
-							closeWaker.Assert()
-						})
+						closeTimer = time.AfterFunc(e.tcpLingerTimeout, closeWaker.Assert)
 						e.waiterQueue.Notify(waiter.EventHUp | waiter.EventErr | waiter.EventIn | waiter.EventOut)
 					}
 				}
@@ -1452,7 +1468,7 @@ func (e *endpoint) protocolMainLoop(handshake bool, wakerInitDone chan<- struct{
 							return err
 						}
 					}
-					if e.EndpointState() != StateClose && e.EndpointState() != StateError {
+					if !e.EndpointState().closed() {
 						// Only block the worker if the endpoint
 						// is not in closed state or error state.
 						close(e.drainDone)
@@ -1508,6 +1524,7 @@ func (e *endpoint) protocolMainLoop(handshake bool, wakerInitDone chan<- struct{
 	// Main loop. Handle segments until both send and receive ends of the
 	// connection have completed.
 	cleanupOnError := func(err *tcpip.Error) {
+		e.stack.Stats().TCP.CurrentConnected.Decrement()
 		e.workerCleanup = true
 		if err != nil {
 			e.resetConnectionLocked(err)
@@ -1517,7 +1534,12 @@ func (e *endpoint) protocolMainLoop(handshake bool, wakerInitDone chan<- struct{
 	}
 
 loop:
-	for e.EndpointState() != StateTimeWait && e.EndpointState() != StateClose && e.EndpointState() != StateError {
+	for {
+		switch e.EndpointState() {
+		case StateTimeWait, StateClose, StateError:
+			break loop
+		}
+
 		e.mu.Unlock()
 		v, _ := s.Fetch(true)
 		e.mu.Lock()
@@ -1560,26 +1582,16 @@ loop:
 		reuseTW = e.doTimeWait()
 	}
 
-	// Mark endpoint as closed.
-	if e.EndpointState() != StateError {
-		e.transitionToStateCloseLocked()
+	// Handle any StateError transition from StateTimeWait.
+	if e.EndpointState() == StateError {
+		cleanupOnError(nil)
+		return nil
 	}
+
+	e.transitionToStateCloseLocked()
 
 	// Lock released below.
 	epilogue()
-
-	// epilogue removes the endpoint from the transport-demuxer and
-	// unlocks e.mu. Now that no new segments can get enqueued to this
-	// endpoint, try to re-match the segment to a different endpoint
-	// as the current endpoint is closed.
-	for {
-		s := e.segmentQueue.dequeue()
-		if s == nil {
-			break
-		}
-
-		e.tryDeliverSegmentFromClosedEndpoint(s)
-	}
 
 	// A new SYN was received during TIME_WAIT and we need to abort
 	// the timewait and redirect the segment to the listener queue
@@ -1690,7 +1702,7 @@ func (e *endpoint) doTimeWait() (twReuse func()) {
 			}
 		case notification:
 			n := e.fetchNotifications()
-			if n&notifyClose != 0 || n&notifyAbort != 0 {
+			if n&notifyAbort != 0 {
 				return nil
 			}
 			if n&notifyDrain != 0 {

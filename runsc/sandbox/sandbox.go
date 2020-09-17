@@ -18,16 +18,19 @@ package sandbox
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"os/exec"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/cenkalti/backoff"
 	specs "github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/syndtr/gocapability/capability"
+	"gvisor.dev/gvisor/pkg/cleanup"
 	"gvisor.dev/gvisor/pkg/control/client"
 	"gvisor.dev/gvisor/pkg/control/server"
 	"gvisor.dev/gvisor/pkg/log"
@@ -38,6 +41,7 @@ import (
 	"gvisor.dev/gvisor/runsc/boot"
 	"gvisor.dev/gvisor/runsc/boot/platforms"
 	"gvisor.dev/gvisor/runsc/cgroup"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/console"
 	"gvisor.dev/gvisor/runsc/specutils"
 )
@@ -113,11 +117,11 @@ type Args struct {
 
 // New creates the sandbox process. The caller must call Destroy() on the
 // sandbox.
-func New(conf *boot.Config, args *Args) (*Sandbox, error) {
+func New(conf *config.Config, args *Args) (*Sandbox, error) {
 	s := &Sandbox{ID: args.ID, Cgroup: args.Cgroup}
 	// The Cleanup object cleans up partially created sandboxes when an error
 	// occurs. Any errors occurring during cleanup itself are ignored.
-	c := specutils.MakeCleanup(func() {
+	c := cleanup.Make(func() {
 		err := s.destroy()
 		log.Warningf("error destroying sandbox: %v", err)
 	})
@@ -142,7 +146,19 @@ func New(conf *boot.Config, args *Args) (*Sandbox, error) {
 	// Wait until the sandbox has booted.
 	b := make([]byte, 1)
 	if l, err := clientSyncFile.Read(b); err != nil || l != 1 {
-		return nil, fmt.Errorf("waiting for sandbox to start: %v", err)
+		err := fmt.Errorf("waiting for sandbox to start: %v", err)
+		// If the sandbox failed to start, it may be because the binary
+		// permissions were incorrect. Check the bits and return a more helpful
+		// error message.
+		//
+		// NOTE: The error message is checked because error types are lost over
+		// rpc calls.
+		if strings.Contains(err.Error(), io.EOF.Error()) {
+			if permsErr := checkBinaryPermissions(conf); permsErr != nil {
+				return nil, fmt.Errorf("%v: %v", err, permsErr)
+			}
+		}
+		return nil, err
 	}
 
 	c.Release()
@@ -165,7 +181,7 @@ func (s *Sandbox) CreateContainer(cid string) error {
 }
 
 // StartRoot starts running the root container process inside the sandbox.
-func (s *Sandbox) StartRoot(spec *specs.Spec, conf *boot.Config) error {
+func (s *Sandbox) StartRoot(spec *specs.Spec, conf *config.Config) error {
 	log.Debugf("Start root sandbox %q, PID: %d", s.ID, s.Pid)
 	conn, err := s.sandboxConnect()
 	if err != nil {
@@ -188,7 +204,7 @@ func (s *Sandbox) StartRoot(spec *specs.Spec, conf *boot.Config) error {
 }
 
 // StartContainer starts running a non-root container inside the sandbox.
-func (s *Sandbox) StartContainer(spec *specs.Spec, conf *boot.Config, cid string, goferFiles []*os.File) error {
+func (s *Sandbox) StartContainer(spec *specs.Spec, conf *config.Config, cid string, goferFiles []*os.File) error {
 	for _, f := range goferFiles {
 		defer f.Close()
 	}
@@ -217,7 +233,7 @@ func (s *Sandbox) StartContainer(spec *specs.Spec, conf *boot.Config, cid string
 }
 
 // Restore sends the restore call for a container in the sandbox.
-func (s *Sandbox) Restore(cid string, spec *specs.Spec, conf *boot.Config, filename string) error {
+func (s *Sandbox) Restore(cid string, spec *specs.Spec, conf *config.Config, filename string) error {
 	log.Debugf("Restore sandbox %q", s.ID)
 
 	rf, err := os.Open(filename)
@@ -329,7 +345,7 @@ func (s *Sandbox) connError(err error) error {
 
 // createSandboxProcess starts the sandbox as a subprocess by running the "boot"
 // command, passing in the bundle dir.
-func (s *Sandbox) createSandboxProcess(conf *boot.Config, args *Args, startSyncFile *os.File) error {
+func (s *Sandbox) createSandboxProcess(conf *config.Config, args *Args, startSyncFile *os.File) error {
 	// nextFD is used to get unused FDs that we can pass to the sandbox.  It
 	// starts at 3 because 0, 1, and 2 are taken by stdin/out/err.
 	nextFD := 3
@@ -388,8 +404,6 @@ func (s *Sandbox) createSandboxProcess(conf *boot.Config, args *Args, startSyncF
 		nextFD++
 	}
 
-	cmd.Args = append(cmd.Args, "--panic-signal="+strconv.Itoa(int(syscall.SIGTERM)))
-
 	// Add the "boot" command to the args.
 	//
 	// All flags after this must be for the boot command
@@ -434,14 +448,24 @@ func (s *Sandbox) createSandboxProcess(conf *boot.Config, args *Args, startSyncF
 		nextFD++
 	}
 
-	// If the platform needs a device FD we must pass it in.
-	if deviceFile, err := deviceFileForPlatform(conf.Platform); err != nil {
+	gPlatform, err := platform.Lookup(conf.Platform)
+	if err != nil {
 		return err
+	}
+
+	if deviceFile, err := gPlatform.OpenDevice(); err != nil {
+		return fmt.Errorf("opening device file for platform %q: %v", gPlatform, err)
 	} else if deviceFile != nil {
 		defer deviceFile.Close()
 		cmd.ExtraFiles = append(cmd.ExtraFiles, deviceFile)
 		cmd.Args = append(cmd.Args, "--device-fd="+strconv.Itoa(nextFD))
 		nextFD++
+	}
+
+	// TODO(b/151157106): syscall tests fail by timeout if asyncpreemptoff
+	// isn't set.
+	if conf.Platform == "kvm" {
+		cmd.Env = append(cmd.Env, "GODEBUG=asyncpreemptoff=1")
 	}
 
 	// The current process' stdio must be passed to the application via the
@@ -454,12 +478,10 @@ func (s *Sandbox) createSandboxProcess(conf *boot.Config, args *Args, startSyncF
 	cmd.Stderr = nil
 
 	// If the console control socket file is provided, then create a new
-	// pty master/slave pair and set the TTY on the sandbox process.
-	if args.ConsoleSocket != "" {
-		cmd.Args = append(cmd.Args, "--console=true")
-
+	// pty master/replica pair and set the TTY on the sandbox process.
+	if args.Spec.Process.Terminal && args.ConsoleSocket != "" {
 		// console.NewWithSocket will send the master on the given
-		// socket, and return the slave.
+		// socket, and return the replica.
 		tty, err := console.NewWithSocket(args.ConsoleSocket)
 		if err != nil {
 			return fmt.Errorf("setting up console with socket %q: %v", args.ConsoleSocket, err)
@@ -521,7 +543,7 @@ func (s *Sandbox) createSandboxProcess(conf *boot.Config, args *Args, startSyncF
 		{Type: specs.UTSNamespace},
 	}
 
-	if conf.Platform == platforms.Ptrace {
+	if gPlatform.Requirements().RequiresCurrentPIDNS {
 		// TODO(b/75837838): Also set a new PID namespace so that we limit
 		// access to other host processes.
 		log.Infof("Sandbox will be started in the current PID namespace")
@@ -534,10 +556,10 @@ func (s *Sandbox) createSandboxProcess(conf *boot.Config, args *Args, startSyncF
 	// Joins the network namespace if network is enabled. the sandbox talks
 	// directly to the host network, which may have been configured in the
 	// namespace.
-	if ns, ok := specutils.GetNS(specs.NetworkNamespace, args.Spec); ok && conf.Network != boot.NetworkNone {
+	if ns, ok := specutils.GetNS(specs.NetworkNamespace, args.Spec); ok && conf.Network != config.NetworkNone {
 		log.Infof("Sandbox will be started in the container's network namespace: %+v", ns)
 		nss = append(nss, ns)
-	} else if conf.Network == boot.NetworkHost {
+	} else if conf.Network == config.NetworkHost {
 		log.Infof("Sandbox will be started in the host network namespace")
 	} else {
 		log.Infof("Sandbox will be started in new network namespace")
@@ -547,7 +569,7 @@ func (s *Sandbox) createSandboxProcess(conf *boot.Config, args *Args, startSyncF
 	// User namespace depends on the network type. Host network requires to run
 	// inside the user namespace specified in the spec or the current namespace
 	// if none is configured.
-	if conf.Network == boot.NetworkHost {
+	if conf.Network == config.NetworkHost {
 		if userns, ok := specutils.GetNS(specs.UserNamespace, args.Spec); ok {
 			log.Infof("Sandbox will be started in container's user namespace: %+v", userns)
 			nss = append(nss, userns)
@@ -582,44 +604,31 @@ func (s *Sandbox) createSandboxProcess(conf *boot.Config, args *Args, startSyncF
 			nss = append(nss, specs.LinuxNamespace{Type: specs.UserNamespace})
 			cmd.Args = append(cmd.Args, "--setup-root")
 
+			const nobody = 65534
 			if conf.Rootless {
-				log.Infof("Rootless mode: sandbox will run as root inside user namespace, mapped to the current user, uid: %d, gid: %d", os.Getuid(), os.Getgid())
+				log.Infof("Rootless mode: sandbox will run as nobody inside user namespace, mapped to the current user, uid: %d, gid: %d", os.Getuid(), os.Getgid())
 				cmd.SysProcAttr.UidMappings = []syscall.SysProcIDMap{
 					{
-						ContainerID: 0,
+						ContainerID: nobody,
 						HostID:      os.Getuid(),
 						Size:        1,
 					},
 				}
 				cmd.SysProcAttr.GidMappings = []syscall.SysProcIDMap{
 					{
-						ContainerID: 0,
+						ContainerID: nobody,
 						HostID:      os.Getgid(),
 						Size:        1,
 					},
 				}
-				cmd.SysProcAttr.Credential = &syscall.Credential{Uid: 0, Gid: 0}
 
 			} else {
 				// Map nobody in the new namespace to nobody in the parent namespace.
 				//
 				// A sandbox process will construct an empty
-				// root for itself, so it has to have the CAP_SYS_ADMIN
-				// capability.
-				//
-				// FIXME(b/122554829): The current implementations of
-				// os/exec doesn't allow to set ambient capabilities if
-				// a process is started in a new user namespace. As a
-				// workaround, we start the sandbox process with the 0
-				// UID and then it constructs a chroot and sets UID to
-				// nobody.  https://github.com/golang/go/issues/2315
-				const nobody = 65534
+				// root for itself, so it has to have
+				// CAP_SYS_ADMIN and CAP_SYS_CHROOT capabilities.
 				cmd.SysProcAttr.UidMappings = []syscall.SysProcIDMap{
-					{
-						ContainerID: 0,
-						HostID:      nobody - 1,
-						Size:        1,
-					},
 					{
 						ContainerID: nobody,
 						HostID:      nobody,
@@ -633,11 +642,11 @@ func (s *Sandbox) createSandboxProcess(conf *boot.Config, args *Args, startSyncF
 						Size:        1,
 					},
 				}
-
-				// Set credentials to run as user and group nobody.
-				cmd.SysProcAttr.Credential = &syscall.Credential{Uid: 0, Gid: nobody}
 			}
 
+			// Set credentials to run as user and group nobody.
+			cmd.SysProcAttr.Credential = &syscall.Credential{Uid: nobody, Gid: nobody}
+			cmd.SysProcAttr.AmbientCaps = append(cmd.SysProcAttr.AmbientCaps, uintptr(capability.CAP_SYS_ADMIN), uintptr(capability.CAP_SYS_CHROOT))
 		} else {
 			return fmt.Errorf("can't run sandbox process as user nobody since we don't have CAP_SETUID or CAP_SETGID")
 		}
@@ -713,7 +722,19 @@ func (s *Sandbox) createSandboxProcess(conf *boot.Config, args *Args, startSyncF
 	log.Debugf("Starting sandbox: %s %v", binPath, cmd.Args)
 	log.Debugf("SysProcAttr: %+v", cmd.SysProcAttr)
 	if err := specutils.StartInNS(cmd, nss); err != nil {
-		return fmt.Errorf("Sandbox: %v", err)
+		err := fmt.Errorf("starting sandbox: %v", err)
+		// If the sandbox failed to start, it may be because the binary
+		// permissions were incorrect. Check the bits and return a more helpful
+		// error message.
+		//
+		// NOTE: The error message is checked because error types are lost over
+		// rpc calls.
+		if strings.Contains(err.Error(), syscall.EACCES.Error()) {
+			if permsErr := checkBinaryPermissions(conf); permsErr != nil {
+				return fmt.Errorf("%v: %v", err, permsErr)
+			}
+		}
+		return err
 	}
 	s.child = true
 	s.Pid = cmd.Process.Pid
@@ -992,26 +1013,6 @@ func (s *Sandbox) StopCPUProfile() error {
 	return nil
 }
 
-// GoroutineProfile writes a goroutine profile to the given file.
-func (s *Sandbox) GoroutineProfile(f *os.File) error {
-	log.Debugf("Goroutine profile %q", s.ID)
-	conn, err := s.sandboxConnect()
-	if err != nil {
-		return err
-	}
-	defer conn.Close()
-
-	opts := control.ProfileOpts{
-		FilePayload: urpc.FilePayload{
-			Files: []*os.File{f},
-		},
-	}
-	if err := conn.Call(boot.GoroutineProfile, &opts, nil); err != nil {
-		return fmt.Errorf("getting sandbox %q goroutine profile: %v", s.ID, err)
-	}
-	return nil
-}
-
 // BlockProfile writes a block profile to the given file.
 func (s *Sandbox) BlockProfile(f *os.File) error {
 	log.Debugf("Block profile %q", s.ID)
@@ -1175,4 +1176,32 @@ func deviceFileForPlatform(name string) (*os.File, error) {
 		return nil, fmt.Errorf("opening device file for platform %q: %v", p, err)
 	}
 	return f, nil
+}
+
+// checkBinaryPermissions verifies that the required binary bits are set on
+// the runsc executable.
+func checkBinaryPermissions(conf *config.Config) error {
+	// All platforms need the other exe bit
+	neededBits := os.FileMode(0001)
+	if conf.Platform == platforms.Ptrace {
+		// Ptrace needs the other read bit
+		neededBits |= os.FileMode(0004)
+	}
+
+	exePath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("getting exe path: %v", err)
+	}
+
+	// Check the permissions of the runsc binary and print an error if it
+	// doesn't match expectations.
+	info, err := os.Stat(exePath)
+	if err != nil {
+		return fmt.Errorf("stat file: %v", err)
+	}
+
+	if info.Mode().Perm()&neededBits != neededBits {
+		return fmt.Errorf(specutils.FaqErrorMsg("runsc-perms", fmt.Sprintf("%s does not have the correct permissions", exePath)))
+	}
+	return nil
 }

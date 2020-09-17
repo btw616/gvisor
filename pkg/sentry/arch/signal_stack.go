@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build i386 amd64 arm64
+// +build 386 amd64 arm64
 
 package arch
 
 import (
+	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
 
@@ -55,6 +56,8 @@ func (s *SignalStack) Contains(sp usermem.Addr) bool {
 // NativeSignalStack is a type that is equivalent to stack_t in the guest
 // architecture.
 type NativeSignalStack interface {
+	marshal.Marshallable
+
 	// SerializeFrom copies the data in the host SignalStack s into this
 	// object.
 	SerializeFrom(s *SignalStack)

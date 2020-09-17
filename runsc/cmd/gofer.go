@@ -30,7 +30,7 @@ import (
 	"gvisor.dev/gvisor/pkg/p9"
 	"gvisor.dev/gvisor/pkg/sync"
 	"gvisor.dev/gvisor/pkg/unet"
-	"gvisor.dev/gvisor/runsc/boot"
+	"gvisor.dev/gvisor/runsc/config"
 	"gvisor.dev/gvisor/runsc/flag"
 	"gvisor.dev/gvisor/runsc/fsgofer"
 	"gvisor.dev/gvisor/runsc/fsgofer/filter"
@@ -100,14 +100,14 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...interface{})
 		return subcommands.ExitUsageError
 	}
 
+	conf := args[0].(*config.Config)
+
 	specFile := os.NewFile(uintptr(g.specFD), "spec file")
 	defer specFile.Close()
-	spec, err := specutils.ReadSpecFromFile(g.bundleDir, specFile)
+	spec, err := specutils.ReadSpecFromFile(g.bundleDir, specFile, conf)
 	if err != nil {
 		Fatalf("reading spec: %v", err)
 	}
-
-	conf := args[0].(*boot.Config)
 
 	if g.setUpRoot {
 		if err := setupRootFS(spec, conf); err != nil {
@@ -168,7 +168,7 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...interface{})
 	// Start with root mount, then add any other additional mount as needed.
 	ats := make([]p9.Attacher, 0, len(spec.Mounts)+1)
 	ap, err := fsgofer.NewAttachPoint("/", fsgofer.Config{
-		ROMount:      spec.Root.Readonly,
+		ROMount:      spec.Root.Readonly || conf.Overlay,
 		PanicOnWrite: g.panicOnWrite,
 	})
 	if err != nil {
@@ -181,7 +181,7 @@ func (g *Gofer) Execute(_ context.Context, f *flag.FlagSet, args ...interface{})
 	for _, m := range spec.Mounts {
 		if specutils.Is9PMount(m) {
 			cfg := fsgofer.Config{
-				ROMount:      isReadonlyMount(m.Options),
+				ROMount:      isReadonlyMount(m.Options) || conf.Overlay,
 				PanicOnWrite: g.panicOnWrite,
 				HostUDS:      conf.FSGoferHostUDS,
 			}
@@ -263,7 +263,7 @@ func isReadonlyMount(opts []string) bool {
 	return false
 }
 
-func setupRootFS(spec *specs.Spec, conf *boot.Config) error {
+func setupRootFS(spec *specs.Spec, conf *config.Config) error {
 	// Convert all shared mounts into slaves to be sure that nothing will be
 	// propagated outside of our namespace.
 	if err := syscall.Mount("", "/", "", syscall.MS_SLAVE|syscall.MS_REC, ""); err != nil {
@@ -272,9 +272,8 @@ func setupRootFS(spec *specs.Spec, conf *boot.Config) error {
 
 	root := spec.Root.Path
 	if !conf.TestOnlyAllowRunAsCurrentUserWithoutChroot {
-		// FIXME: runsc can't be re-executed without
-		// /proc, so we create a tmpfs mount, mount ./proc and ./root
-		// there, then move this mount to the root and after
+		// runsc can't be re-executed without /proc, so we create a tmpfs mount,
+		// mount ./proc and ./root there, then move this mount to the root and after
 		// setCapsAndCallSelf, runsc will chroot into /root.
 		//
 		// We need a directory to construct a new root and we know that
@@ -307,7 +306,7 @@ func setupRootFS(spec *specs.Spec, conf *boot.Config) error {
 	}
 
 	// Replace the current spec, with the clean spec with symlinks resolved.
-	if err := setupMounts(spec.Mounts, root); err != nil {
+	if err := setupMounts(conf, spec.Mounts, root); err != nil {
 		Fatalf("error setting up FS: %v", err)
 	}
 
@@ -323,7 +322,7 @@ func setupRootFS(spec *specs.Spec, conf *boot.Config) error {
 	}
 
 	// Check if root needs to be remounted as readonly.
-	if spec.Root.Readonly {
+	if spec.Root.Readonly || conf.Overlay {
 		// If root is a mount point but not read-only, we can change mount options
 		// to make it read-only for extra safety.
 		log.Infof("Remounting root as readonly: %q", root)
@@ -347,7 +346,7 @@ func setupRootFS(spec *specs.Spec, conf *boot.Config) error {
 // setupMounts binds mount all mounts specified in the spec in their correct
 // location inside root. It will resolve relative paths and symlinks. It also
 // creates directories as needed.
-func setupMounts(mounts []specs.Mount, root string) error {
+func setupMounts(conf *config.Config, mounts []specs.Mount, root string) error {
 	for _, m := range mounts {
 		if m.Type != "bind" || !specutils.IsSupportedDevMount(m) {
 			continue
@@ -359,6 +358,11 @@ func setupMounts(mounts []specs.Mount, root string) error {
 		}
 
 		flags := specutils.OptionsToFlags(m.Options) | syscall.MS_BIND
+		if conf.Overlay {
+			// Force mount read-only if writes are not going to be sent to it.
+			flags |= syscall.MS_RDONLY
+		}
+
 		log.Infof("Mounting src: %q, dst: %q, flags: %#x", m.Source, dst, flags)
 		if err := specutils.Mount(m.Source, dst, m.Type, flags); err != nil {
 			return fmt.Errorf("mounting %v: %v", m, err)
@@ -381,7 +385,7 @@ func setupMounts(mounts []specs.Mount, root string) error {
 // Otherwise, it may follow symlinks to locations that would be overwritten
 // with another mount point and return the wrong location. In short, make sure
 // setupMounts() has been called before.
-func resolveMounts(conf *boot.Config, mounts []specs.Mount, root string) ([]specs.Mount, error) {
+func resolveMounts(conf *config.Config, mounts []specs.Mount, root string) ([]specs.Mount, error) {
 	cleanMounts := make([]specs.Mount, 0, len(mounts))
 	for _, m := range mounts {
 		if m.Type != "bind" || !specutils.IsSupportedDevMount(m) {
@@ -463,7 +467,7 @@ func resolveSymlinksImpl(root, base, rel string, followCount uint) (string, erro
 }
 
 // adjustMountOptions adds 'overlayfs_stale_read' if mounting over overlayfs.
-func adjustMountOptions(conf *boot.Config, path string, opts []string) ([]string, error) {
+func adjustMountOptions(conf *config.Config, path string, opts []string) ([]string, error) {
 	rv := make([]string, len(opts))
 	copy(rv, opts)
 

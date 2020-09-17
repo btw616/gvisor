@@ -26,7 +26,8 @@ import (
 // beforeSave is invoked by stateify.
 func (s *session) beforeSave() {
 	if s.overrides != nil {
-		if err := s.fillPathMap(); err != nil {
+		ctx := &dummyClockContext{context.Background()}
+		if err := s.fillPathMap(ctx); err != nil {
 			panic("failed to save paths to override map before saving" + err.Error())
 		}
 	}
@@ -104,7 +105,6 @@ func (s *session) afterLoad() {
 	// If private unix sockets are enabled, create and fill the session's endpoint
 	// maps.
 	if opts.privateunixsocket {
-		// TODO(b/38173783): Context is not plumbed to save/restore.
 		ctx := &dummyClockContext{context.Background()}
 
 		if err = s.restoreEndpointMaps(ctx); err != nil {

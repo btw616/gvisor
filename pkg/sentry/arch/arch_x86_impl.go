@@ -12,13 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build amd64 i386
+// +build amd64 386
 
 package arch
 
 import (
-	"syscall"
-
 	"gvisor.dev/gvisor/pkg/cpuid"
 )
 
@@ -28,7 +26,7 @@ import (
 // +stateify savable
 type State struct {
 	// The system registers.
-	Regs syscall.PtraceRegs `state:".(syscallPtraceRegs)"`
+	Regs Registers
 
 	// Our floating point state.
 	x86FPState `state:"wait"`

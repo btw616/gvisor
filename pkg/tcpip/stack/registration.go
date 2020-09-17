@@ -18,6 +18,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sleep"
 	"gvisor.dev/gvisor/pkg/tcpip"
 	"gvisor.dev/gvisor/pkg/tcpip/buffer"
+	"gvisor.dev/gvisor/pkg/tcpip/header"
 	"gvisor.dev/gvisor/pkg/waiter"
 )
 
@@ -51,8 +52,11 @@ type TransportEndpointID struct {
 type ControlType int
 
 // The following are the allowed values for ControlType values.
+// TODO(http://gvisor.dev/issue/3210): Support time exceeded messages.
 const (
-	ControlPacketTooBig ControlType = iota
+	ControlNetworkUnreachable ControlType = iota
+	ControlNoRoute
+	ControlPacketTooBig
 	ControlPortUnreachable
 	ControlUnknown
 )
@@ -67,12 +71,12 @@ type TransportEndpoint interface {
 	// this transport endpoint. It sets pkt.TransportHeader.
 	//
 	// HandlePacket takes ownership of pkt.
-	HandlePacket(r *Route, id TransportEndpointID, pkt PacketBuffer)
+	HandlePacket(r *Route, id TransportEndpointID, pkt *PacketBuffer)
 
 	// HandleControlPacket is called by the stack when new control (e.g.
 	// ICMP) packets arrive to this transport endpoint.
 	// HandleControlPacket takes ownership of pkt.
-	HandleControlPacket(id TransportEndpointID, typ ControlType, extra uint32, pkt PacketBuffer)
+	HandleControlPacket(id TransportEndpointID, typ ControlType, extra uint32, pkt *PacketBuffer)
 
 	// Abort initiates an expedited endpoint teardown. It puts the endpoint
 	// in a closed state and frees all resources associated with it. This
@@ -100,7 +104,7 @@ type RawTransportEndpoint interface {
 	// layer up.
 	//
 	// HandlePacket takes ownership of pkt.
-	HandlePacket(r *Route, pkt PacketBuffer)
+	HandlePacket(r *Route, pkt *PacketBuffer)
 }
 
 // PacketEndpoint is the interface that needs to be implemented by packet
@@ -118,7 +122,7 @@ type PacketEndpoint interface {
 	// should construct its own ethernet header for applications.
 	//
 	// HandlePacket takes ownership of pkt.
-	HandlePacket(nicID tcpip.NICID, addr tcpip.LinkAddress, netProto tcpip.NetworkProtocolNumber, pkt PacketBuffer)
+	HandlePacket(nicID tcpip.NICID, addr tcpip.LinkAddress, netProto tcpip.NetworkProtocolNumber, pkt *PacketBuffer)
 }
 
 // TransportProtocol is the interface that needs to be implemented by transport
@@ -150,17 +154,17 @@ type TransportProtocol interface {
 	// stats purposes only).
 	//
 	// HandleUnknownDestinationPacket takes ownership of pkt.
-	HandleUnknownDestinationPacket(r *Route, id TransportEndpointID, pkt PacketBuffer) bool
+	HandleUnknownDestinationPacket(r *Route, id TransportEndpointID, pkt *PacketBuffer) bool
 
 	// SetOption allows enabling/disabling protocol specific features.
 	// SetOption returns an error if the option is not supported or the
 	// provided option value is invalid.
-	SetOption(option interface{}) *tcpip.Error
+	SetOption(option tcpip.SettableTransportProtocolOption) *tcpip.Error
 
 	// Option allows retrieving protocol specific option values.
 	// Option returns an error if the option is not supported or the
 	// provided option value is invalid.
-	Option(option interface{}) *tcpip.Error
+	Option(option tcpip.GettableTransportProtocolOption) *tcpip.Error
 
 	// Close requests that any worker goroutines owned by the protocol
 	// stop.
@@ -168,6 +172,11 @@ type TransportProtocol interface {
 
 	// Wait waits for any worker goroutines owned by the protocol to stop.
 	Wait()
+
+	// Parse sets pkt.TransportHeader and trims pkt.Data appropriately. It does
+	// neither and returns false if pkt.Data is too small, i.e. pkt.Data.Size() <
+	// MinimumPacketSize()
+	Parse(pkt *PacketBuffer) (ok bool)
 }
 
 // TransportDispatcher contains the methods used by the network stack to deliver
@@ -180,7 +189,7 @@ type TransportDispatcher interface {
 	// pkt.NetworkHeader must be set before calling DeliverTransportPacket.
 	//
 	// DeliverTransportPacket takes ownership of pkt.
-	DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolNumber, pkt PacketBuffer)
+	DeliverTransportPacket(r *Route, protocol tcpip.TransportProtocolNumber, pkt *PacketBuffer)
 
 	// DeliverTransportControlPacket delivers control packets to the
 	// appropriate transport protocol endpoint.
@@ -189,7 +198,7 @@ type TransportDispatcher interface {
 	// DeliverTransportControlPacket.
 	//
 	// DeliverTransportControlPacket takes ownership of pkt.
-	DeliverTransportControlPacket(local, remote tcpip.Address, net tcpip.NetworkProtocolNumber, trans tcpip.TransportProtocolNumber, typ ControlType, extra uint32, pkt PacketBuffer)
+	DeliverTransportControlPacket(local, remote tcpip.Address, net tcpip.NetworkProtocolNumber, trans tcpip.TransportProtocolNumber, typ ControlType, extra uint32, pkt *PacketBuffer)
 }
 
 // PacketLooping specifies where an outbound packet should be sent.
@@ -240,23 +249,18 @@ type NetworkEndpoint interface {
 	MaxHeaderLength() uint16
 
 	// WritePacket writes a packet to the given destination address and
-	// protocol. It sets pkt.NetworkHeader. pkt.TransportHeader must have
+	// protocol. It takes ownership of pkt. pkt.TransportHeader must have
 	// already been set.
-	WritePacket(r *Route, gso *GSO, params NetworkHeaderParams, pkt PacketBuffer) *tcpip.Error
+	WritePacket(r *Route, gso *GSO, params NetworkHeaderParams, pkt *PacketBuffer) *tcpip.Error
 
 	// WritePackets writes packets to the given destination address and
-	// protocol. pkts must not be zero length.
-	WritePackets(r *Route, gso *GSO, pkts []PacketBuffer, params NetworkHeaderParams) (int, *tcpip.Error)
+	// protocol. pkts must not be zero length. It takes ownership of pkts and
+	// underlying packets.
+	WritePackets(r *Route, gso *GSO, pkts PacketBufferList, params NetworkHeaderParams) (int, *tcpip.Error)
 
 	// WriteHeaderIncludedPacket writes a packet that includes a network
-	// header to the given destination address.
-	WriteHeaderIncludedPacket(r *Route, pkt PacketBuffer) *tcpip.Error
-
-	// ID returns the network protocol endpoint ID.
-	ID() *NetworkEndpointID
-
-	// PrefixLen returns the network endpoint's subnet prefix length in bits.
-	PrefixLen() int
+	// header to the given destination address. It takes ownership of pkt.
+	WriteHeaderIncludedPacket(r *Route, pkt *PacketBuffer) *tcpip.Error
 
 	// NICID returns the id of the NIC this endpoint belongs to.
 	NICID() tcpip.NICID
@@ -265,10 +269,14 @@ type NetworkEndpoint interface {
 	// this network endpoint. It sets pkt.NetworkHeader.
 	//
 	// HandlePacket takes ownership of pkt.
-	HandlePacket(r *Route, pkt PacketBuffer)
+	HandlePacket(r *Route, pkt *PacketBuffer)
 
 	// Close is called when the endpoint is reomved from a stack.
 	Close()
+
+	// NetworkProtocolNumber returns the tcpip.NetworkProtocolNumber for
+	// this endpoint.
+	NetworkProtocolNumber() tcpip.NetworkProtocolNumber
 }
 
 // NetworkProtocol is the interface that needs to be implemented by network
@@ -290,17 +298,17 @@ type NetworkProtocol interface {
 	ParseAddresses(v buffer.View) (src, dst tcpip.Address)
 
 	// NewEndpoint creates a new endpoint of this protocol.
-	NewEndpoint(nicID tcpip.NICID, addrWithPrefix tcpip.AddressWithPrefix, linkAddrCache LinkAddressCache, dispatcher TransportDispatcher, sender LinkEndpoint, st *Stack) (NetworkEndpoint, *tcpip.Error)
+	NewEndpoint(nicID tcpip.NICID, linkAddrCache LinkAddressCache, nud NUDHandler, dispatcher TransportDispatcher, sender LinkEndpoint, st *Stack) NetworkEndpoint
 
 	// SetOption allows enabling/disabling protocol specific features.
 	// SetOption returns an error if the option is not supported or the
 	// provided option value is invalid.
-	SetOption(option interface{}) *tcpip.Error
+	SetOption(option tcpip.SettableNetworkProtocolOption) *tcpip.Error
 
 	// Option allows retrieving protocol specific option values.
 	// Option returns an error if the option is not supported or the
 	// provided option value is invalid.
-	Option(option interface{}) *tcpip.Error
+	Option(option tcpip.GettableNetworkProtocolOption) *tcpip.Error
 
 	// Close requests that any worker goroutines owned by the protocol
 	// stop.
@@ -308,11 +316,18 @@ type NetworkProtocol interface {
 
 	// Wait waits for any worker goroutines owned by the protocol to stop.
 	Wait()
+
+	// Parse sets pkt.NetworkHeader and trims pkt.Data appropriately. It
+	// returns:
+	// - The encapsulated protocol, if present.
+	// - Whether there is an encapsulated transport protocol payload (e.g. ARP
+	//   does not encapsulate anything).
+	// - Whether pkt.Data was large enough to parse and set pkt.NetworkHeader.
+	Parse(pkt *PacketBuffer) (proto tcpip.TransportProtocolNumber, hasTransportHdr bool, ok bool)
 }
 
 // NetworkDispatcher contains the methods used by the network stack to deliver
-// packets to the appropriate network endpoint after it has been handled by
-// the data link layer.
+// inbound/outbound packets to the appropriate network/packet(if any) endpoints.
 type NetworkDispatcher interface {
 	// DeliverNetworkPacket finds the appropriate network protocol endpoint
 	// and hands the packet over for further processing.
@@ -322,7 +337,17 @@ type NetworkDispatcher interface {
 	// packets sent via loopback), and won't have the field set.
 	//
 	// DeliverNetworkPacket takes ownership of pkt.
-	DeliverNetworkPacket(linkEP LinkEndpoint, remote, local tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt PacketBuffer)
+	DeliverNetworkPacket(remote, local tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer)
+
+	// DeliverOutboundPacket is called by link layer when a packet is being
+	// sent out.
+	//
+	// pkt.LinkHeader may or may not be set before calling
+	// DeliverOutboundPacket. Some packets do not have link headers (e.g.
+	// packets sent via loopback), and won't have the field set.
+	//
+	// DeliverOutboundPacket takes ownership of pkt.
+	DeliverOutboundPacket(remote, local tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer)
 }
 
 // LinkEndpointCapabilities is the type associated with the capabilities
@@ -378,25 +403,25 @@ type LinkEndpoint interface {
 	LinkAddress() tcpip.LinkAddress
 
 	// WritePacket writes a packet with the given protocol through the
-	// given route. It sets pkt.LinkHeader if a link layer header exists.
-	// pkt.NetworkHeader and pkt.TransportHeader must have already been
-	// set.
+	// given route. It takes ownership of pkt. pkt.NetworkHeader and
+	// pkt.TransportHeader must have already been set.
 	//
 	// To participate in transparent bridging, a LinkEndpoint implementation
 	// should call eth.Encode with header.EthernetFields.SrcAddr set to
 	// r.LocalLinkAddress if it is provided.
-	WritePacket(r *Route, gso *GSO, protocol tcpip.NetworkProtocolNumber, pkt PacketBuffer) *tcpip.Error
+	WritePacket(r *Route, gso *GSO, protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer) *tcpip.Error
 
 	// WritePackets writes packets with the given protocol through the
-	// given route. pkts must not be zero length.
+	// given route. pkts must not be zero length. It takes ownership of pkts and
+	// underlying packets.
 	//
 	// Right now, WritePackets is used only when the software segmentation
 	// offload is enabled. If it will be used for something else, it may
 	// require to change syscall filters.
-	WritePackets(r *Route, gso *GSO, pkts []PacketBuffer, protocol tcpip.NetworkProtocolNumber) (int, *tcpip.Error)
+	WritePackets(r *Route, gso *GSO, pkts PacketBufferList, protocol tcpip.NetworkProtocolNumber) (int, *tcpip.Error)
 
 	// WriteRawPacket writes a packet directly to the link. The packet
-	// should already have an ethernet header.
+	// should already have an ethernet header. It takes ownership of vv.
 	WriteRawPacket(vv buffer.VectorisedView) *tcpip.Error
 
 	// Attach attaches the data link layer endpoint to the network-layer
@@ -418,6 +443,15 @@ type LinkEndpoint interface {
 	// Wait will not block if the endpoint hasn't started any goroutines
 	// yet, even if it might later.
 	Wait()
+
+	// ARPHardwareType returns the ARPHRD_TYPE of the link endpoint.
+	//
+	// See:
+	// https://github.com/torvalds/linux/blob/aa0c9086b40c17a7ad94425b3b70dd1fdd7497bf/include/uapi/linux/if_arp.h#L30
+	ARPHardwareType() header.ARPHardwareType
+
+	// AddHeader adds a link layer header to pkt if required.
+	AddHeader(local, remote tcpip.LinkAddress, protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer)
 }
 
 // InjectableLinkEndpoint is a LinkEndpoint where inbound packets are
@@ -426,7 +460,7 @@ type InjectableLinkEndpoint interface {
 	LinkEndpoint
 
 	// InjectInbound injects an inbound packet.
-	InjectInbound(protocol tcpip.NetworkProtocolNumber, pkt PacketBuffer)
+	InjectInbound(protocol tcpip.NetworkProtocolNumber, pkt *PacketBuffer)
 
 	// InjectOutbound writes a fully formed outbound packet directly to the
 	// link.
@@ -438,12 +472,13 @@ type InjectableLinkEndpoint interface {
 // A LinkAddressResolver is an extension to a NetworkProtocol that
 // can resolve link addresses.
 type LinkAddressResolver interface {
-	// LinkAddressRequest sends a request for the LinkAddress of addr.
-	// The request is sent on linkEP with localAddr as the source.
+	// LinkAddressRequest sends a request for the LinkAddress of addr. Broadcasts
+	// the request on the local network if remoteLinkAddr is the zero value. The
+	// request is sent on linkEP with localAddr as the source.
 	//
 	// A valid response will cause the discovery protocol's network
 	// endpoint to call AddLinkAddress.
-	LinkAddressRequest(addr, localAddr tcpip.Address, linkEP LinkEndpoint) *tcpip.Error
+	LinkAddressRequest(addr, localAddr tcpip.Address, remoteLinkAddr tcpip.LinkAddress, linkEP LinkEndpoint) *tcpip.Error
 
 	// ResolveStaticAddress attempts to resolve address without sending
 	// requests. It either resolves the name immediately or returns the
@@ -453,7 +488,7 @@ type LinkAddressResolver interface {
 	ResolveStaticAddress(addr tcpip.Address) (tcpip.LinkAddress, bool)
 
 	// LinkAddressProtocol returns the network protocol of the
-	// addresses this this resolver can resolve.
+	// addresses this resolver can resolve.
 	LinkAddressProtocol() tcpip.NetworkProtocolNumber
 }
 

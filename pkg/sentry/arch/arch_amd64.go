@@ -22,8 +22,9 @@ import (
 	"math/rand"
 	"syscall"
 
-	"gvisor.dev/gvisor/pkg/binary"
 	"gvisor.dev/gvisor/pkg/cpuid"
+	"gvisor.dev/gvisor/pkg/marshal"
+	"gvisor.dev/gvisor/pkg/marshal/primitive"
 	"gvisor.dev/gvisor/pkg/sentry/limits"
 	"gvisor.dev/gvisor/pkg/usermem"
 )
@@ -180,14 +181,14 @@ func (c *context64) SetOldRSeqInterruptedIP(value uintptr) {
 }
 
 // Native returns the native type for the given val.
-func (c *context64) Native(val uintptr) interface{} {
-	v := uint64(val)
+func (c *context64) Native(val uintptr) marshal.Marshallable {
+	v := primitive.Uint64(val)
 	return &v
 }
 
 // Value returns the generic val for the given native type.
-func (c *context64) Value(val interface{}) uintptr {
-	return uintptr(*val.(*uint64))
+func (c *context64) Value(val marshal.Marshallable) uintptr {
+	return uintptr(*val.(*primitive.Uint64))
 }
 
 // Width returns the byte width of this architecture.
@@ -294,15 +295,17 @@ func (c *context64) PIELoadAddress(l MmapLayout) usermem.Addr {
 const userStructSize = 928
 
 // PtracePeekUser implements Context.PtracePeekUser.
-func (c *context64) PtracePeekUser(addr uintptr) (interface{}, error) {
+func (c *context64) PtracePeekUser(addr uintptr) (marshal.Marshallable, error) {
 	if addr&7 != 0 || addr >= userStructSize {
 		return nil, syscall.EIO
 	}
 	// PTRACE_PEEKUSER and PTRACE_POKEUSER are only effective on regs and
 	// u_debugreg, returning 0 or silently no-oping for other fields
 	// respectively.
-	if addr < uintptr(ptraceRegsSize) {
-		buf := binary.Marshal(nil, usermem.ByteOrder, c.ptraceGetRegs())
+	if addr < uintptr(ptraceRegistersSize) {
+		regs := c.ptraceGetRegs()
+		buf := make([]byte, regs.SizeBytes())
+		regs.MarshalUnsafe(buf)
 		return c.Native(uintptr(usermem.ByteOrder.Uint64(buf[addr:]))), nil
 	}
 	// Note: x86 debug registers are missing.
@@ -314,8 +317,10 @@ func (c *context64) PtracePokeUser(addr, data uintptr) error {
 	if addr&7 != 0 || addr >= userStructSize {
 		return syscall.EIO
 	}
-	if addr < uintptr(ptraceRegsSize) {
-		buf := binary.Marshal(nil, usermem.ByteOrder, c.ptraceGetRegs())
+	if addr < uintptr(ptraceRegistersSize) {
+		regs := c.ptraceGetRegs()
+		buf := make([]byte, regs.SizeBytes())
+		regs.MarshalUnsafe(buf)
 		usermem.ByteOrder.PutUint64(buf[addr:], uint64(data))
 		_, err := c.PtraceSetRegs(bytes.NewBuffer(buf))
 		return err

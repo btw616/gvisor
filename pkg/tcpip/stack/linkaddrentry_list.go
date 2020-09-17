@@ -52,12 +52,21 @@ func (l *linkAddrEntryList) Back() *linkAddrEntry {
 	return l.tail
 }
 
+// Len returns the number of elements in the list.
+//
+// NOTE: This is an O(n) operation.
+func (l *linkAddrEntryList) Len() (count int) {
+	for e := l.Front(); e != nil; e = (linkAddrEntryElementMapper{}.linkerFor(e)).Next() {
+		count++
+	}
+	return count
+}
+
 // PushFront inserts the element e at the front of list l.
 func (l *linkAddrEntryList) PushFront(e *linkAddrEntry) {
 	linker := linkAddrEntryElementMapper{}.linkerFor(e)
 	linker.SetNext(l.head)
 	linker.SetPrev(nil)
-
 	if l.head != nil {
 		linkAddrEntryElementMapper{}.linkerFor(l.head).SetPrev(e)
 	} else {
@@ -72,7 +81,6 @@ func (l *linkAddrEntryList) PushBack(e *linkAddrEntry) {
 	linker := linkAddrEntryElementMapper{}.linkerFor(e)
 	linker.SetNext(nil)
 	linker.SetPrev(l.tail)
-
 	if l.tail != nil {
 		linkAddrEntryElementMapper{}.linkerFor(l.tail).SetNext(e)
 	} else {
@@ -93,7 +101,6 @@ func (l *linkAddrEntryList) PushBackList(m *linkAddrEntryList) {
 
 		l.tail = m.tail
 	}
-
 	m.head = nil
 	m.tail = nil
 }
@@ -141,13 +148,13 @@ func (l *linkAddrEntryList) Remove(e *linkAddrEntry) {
 
 	if prev != nil {
 		linkAddrEntryElementMapper{}.linkerFor(prev).SetNext(next)
-	} else {
+	} else if l.head == e {
 		l.head = next
 	}
 
 	if next != nil {
 		linkAddrEntryElementMapper{}.linkerFor(next).SetPrev(prev)
-	} else {
+	} else if l.tail == e {
 		l.tail = prev
 	}
 

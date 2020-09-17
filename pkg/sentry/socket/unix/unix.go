@@ -23,7 +23,8 @@ import (
 
 	"gvisor.dev/gvisor/pkg/abi/linux"
 	"gvisor.dev/gvisor/pkg/context"
-	"gvisor.dev/gvisor/pkg/refs"
+	"gvisor.dev/gvisor/pkg/fspath"
+	"gvisor.dev/gvisor/pkg/marshal"
 	"gvisor.dev/gvisor/pkg/sentry/arch"
 	"gvisor.dev/gvisor/pkg/sentry/fs"
 	"gvisor.dev/gvisor/pkg/sentry/fs/fsutil"
@@ -33,6 +34,7 @@ import (
 	"gvisor.dev/gvisor/pkg/sentry/socket/control"
 	"gvisor.dev/gvisor/pkg/sentry/socket/netstack"
 	"gvisor.dev/gvisor/pkg/sentry/socket/unix/transport"
+	"gvisor.dev/gvisor/pkg/sentry/vfs"
 	"gvisor.dev/gvisor/pkg/syserr"
 	"gvisor.dev/gvisor/pkg/syserror"
 	"gvisor.dev/gvisor/pkg/tcpip"
@@ -52,17 +54,14 @@ type SocketOperations struct {
 	fsutil.FileNoSplice             `state:"nosave"`
 	fsutil.FileNoopFlush            `state:"nosave"`
 	fsutil.FileUseInodeUnstableAttr `state:"nosave"`
-	refs.AtomicRefCount
-	socket.SendReceiveTimeout
 
-	ep    transport.Endpoint
-	stype linux.SockType
+	socketOpsCommon
 }
 
 // New creates a new unix socket.
 func New(ctx context.Context, endpoint transport.Endpoint, stype linux.SockType) *fs.File {
 	dirent := socket.NewDirent(ctx, unixSocketDevice)
-	defer dirent.DecRef()
+	defer dirent.DecRef(ctx)
 	return NewWithDirent(ctx, dirent, endpoint, stype, fs.FileFlags{Read: true, Write: true, NonSeekable: true})
 }
 
@@ -75,29 +74,51 @@ func NewWithDirent(ctx context.Context, d *fs.Dirent, ep transport.Endpoint, sty
 	}
 
 	s := SocketOperations{
-		ep:    ep,
-		stype: stype,
+		socketOpsCommon: socketOpsCommon{
+			ep:    ep,
+			stype: stype,
+		},
 	}
-	s.EnableLeakCheck("unix.SocketOperations")
+	s.EnableLeakCheck()
 
 	return fs.NewFile(ctx, d, flags, &s)
 }
 
+// socketOpsCommon contains the socket operations common to VFS1 and VFS2.
+//
+// +stateify savable
+type socketOpsCommon struct {
+	socketOpsCommonRefs
+	socket.SendReceiveTimeout
+
+	ep    transport.Endpoint
+	stype linux.SockType
+
+	// abstractName and abstractNamespace indicate the name and namespace of the
+	// socket if it is bound to an abstract socket namespace. Once the socket is
+	// bound, they cannot be modified.
+	abstractName      string
+	abstractNamespace *kernel.AbstractSocketNamespace
+}
+
 // DecRef implements RefCounter.DecRef.
-func (s *SocketOperations) DecRef() {
-	s.DecRefWithDestructor(func() {
-		s.ep.Close()
+func (s *socketOpsCommon) DecRef(ctx context.Context) {
+	s.socketOpsCommonRefs.DecRef(func() {
+		s.ep.Close(ctx)
+		if s.abstractNamespace != nil {
+			s.abstractNamespace.Remove(s.abstractName, s)
+		}
 	})
 }
 
 // Release implemements fs.FileOperations.Release.
-func (s *SocketOperations) Release() {
+func (s *socketOpsCommon) Release(ctx context.Context) {
 	// Release only decrements a reference on s because s may be referenced in
 	// the abstract socket namespace.
-	s.DecRef()
+	s.DecRef(ctx)
 }
 
-func (s *SocketOperations) isPacket() bool {
+func (s *socketOpsCommon) isPacket() bool {
 	switch s.stype {
 	case linux.SOCK_DGRAM, linux.SOCK_SEQPACKET:
 		return true
@@ -110,7 +131,7 @@ func (s *SocketOperations) isPacket() bool {
 }
 
 // Endpoint extracts the transport.Endpoint.
-func (s *SocketOperations) Endpoint() transport.Endpoint {
+func (s *socketOpsCommon) Endpoint() transport.Endpoint {
 	return s.ep
 }
 
@@ -143,7 +164,7 @@ func extractPath(sockaddr []byte) (string, *syserr.Error) {
 
 // GetPeerName implements the linux syscall getpeername(2) for sockets backed by
 // a transport.Endpoint.
-func (s *SocketOperations) GetPeerName(t *kernel.Task) (linux.SockAddr, uint32, *syserr.Error) {
+func (s *socketOpsCommon) GetPeerName(t *kernel.Task) (linux.SockAddr, uint32, *syserr.Error) {
 	addr, err := s.ep.GetRemoteAddress()
 	if err != nil {
 		return nil, 0, syserr.TranslateNetstackError(err)
@@ -155,7 +176,7 @@ func (s *SocketOperations) GetPeerName(t *kernel.Task) (linux.SockAddr, uint32, 
 
 // GetSockName implements the linux syscall getsockname(2) for sockets backed by
 // a transport.Endpoint.
-func (s *SocketOperations) GetSockName(t *kernel.Task) (linux.SockAddr, uint32, *syserr.Error) {
+func (s *socketOpsCommon) GetSockName(t *kernel.Task) (linux.SockAddr, uint32, *syserr.Error) {
 	addr, err := s.ep.GetLocalAddress()
 	if err != nil {
 		return nil, 0, syserr.TranslateNetstackError(err)
@@ -172,19 +193,19 @@ func (s *SocketOperations) Ioctl(ctx context.Context, _ *fs.File, io usermem.IO,
 
 // GetSockOpt implements the linux syscall getsockopt(2) for sockets backed by
 // a transport.Endpoint.
-func (s *SocketOperations) GetSockOpt(t *kernel.Task, level, name int, outPtr usermem.Addr, outLen int) (interface{}, *syserr.Error) {
-	return netstack.GetSockOpt(t, s, s.ep, linux.AF_UNIX, s.ep.Type(), level, name, outLen)
+func (s *SocketOperations) GetSockOpt(t *kernel.Task, level, name int, outPtr usermem.Addr, outLen int) (marshal.Marshallable, *syserr.Error) {
+	return netstack.GetSockOpt(t, s, s.ep, linux.AF_UNIX, s.ep.Type(), level, name, outPtr, outLen)
 }
 
 // Listen implements the linux syscall listen(2) for sockets backed by
 // a transport.Endpoint.
-func (s *SocketOperations) Listen(t *kernel.Task, backlog int) *syserr.Error {
+func (s *socketOpsCommon) Listen(t *kernel.Task, backlog int) *syserr.Error {
 	return s.ep.Listen(backlog)
 }
 
 // blockingAccept implements a blocking version of accept(2), that is, if no
 // connections are ready to be accept, it will block until one becomes ready.
-func (s *SocketOperations) blockingAccept(t *kernel.Task) (transport.Endpoint, *syserr.Error) {
+func (s *SocketOperations) blockingAccept(t *kernel.Task, peerAddr *tcpip.FullAddress) (transport.Endpoint, *syserr.Error) {
 	// Register for notifications.
 	e, ch := waiter.NewChannelEntry(nil)
 	s.EventRegister(&e, waiter.EventIn)
@@ -193,7 +214,7 @@ func (s *SocketOperations) blockingAccept(t *kernel.Task) (transport.Endpoint, *
 	// Try to accept the connection; if it fails, then wait until we get a
 	// notification.
 	for {
-		if ep, err := s.ep.Accept(); err != syserr.ErrWouldBlock {
+		if ep, err := s.ep.Accept(peerAddr); err != syserr.ErrWouldBlock {
 			return ep, err
 		}
 
@@ -206,22 +227,25 @@ func (s *SocketOperations) blockingAccept(t *kernel.Task) (transport.Endpoint, *
 // Accept implements the linux syscall accept(2) for sockets backed by
 // a transport.Endpoint.
 func (s *SocketOperations) Accept(t *kernel.Task, peerRequested bool, flags int, blocking bool) (int32, linux.SockAddr, uint32, *syserr.Error) {
-	// Issue the accept request to get the new endpoint.
-	ep, err := s.ep.Accept()
+	var peerAddr *tcpip.FullAddress
+	if peerRequested {
+		peerAddr = &tcpip.FullAddress{}
+	}
+	ep, err := s.ep.Accept(peerAddr)
 	if err != nil {
 		if err != syserr.ErrWouldBlock || !blocking {
 			return 0, nil, 0, err
 		}
 
 		var err *syserr.Error
-		ep, err = s.blockingAccept(t)
+		ep, err = s.blockingAccept(t, peerAddr)
 		if err != nil {
 			return 0, nil, 0, err
 		}
 	}
 
 	ns := New(t, ep, s.stype)
-	defer ns.DecRef()
+	defer ns.DecRef(t)
 
 	if flags&linux.SOCK_NONBLOCK != 0 {
 		flags := ns.Flags()
@@ -231,13 +255,8 @@ func (s *SocketOperations) Accept(t *kernel.Task, peerRequested bool, flags int,
 
 	var addr linux.SockAddr
 	var addrLen uint32
-	if peerRequested {
-		// Get address of the peer.
-		var err *syserr.Error
-		addr, addrLen, err = ns.FileOperations.(*SocketOperations).GetPeerName(t)
-		if err != nil {
-			return 0, nil, 0, err
-		}
+	if peerAddr != nil {
+		addr, addrLen = netstack.ConvertAddress(linux.AF_UNIX, *peerAddr)
 	}
 
 	fd, e := t.NewFDFrom(0, ns, kernel.FDFlags{
@@ -271,17 +290,21 @@ func (s *SocketOperations) Bind(t *kernel.Task, sockaddr []byte) *syserr.Error {
 			if t.IsNetworkNamespaced() {
 				return syserr.ErrInvalidEndpointState
 			}
-			if err := t.AbstractSockets().Bind(p[1:], bep, s); err != nil {
+			asn := t.AbstractSockets()
+			name := p[1:]
+			if err := asn.Bind(t, name, bep, s); err != nil {
 				// syserr.ErrPortInUse corresponds to EADDRINUSE.
 				return syserr.ErrPortInUse
 			}
+			s.abstractName = name
+			s.abstractNamespace = asn
 		} else {
 			// The parent and name.
 			var d *fs.Dirent
 			var name string
 
 			cwd := t.FSContext().WorkingDirectory()
-			defer cwd.DecRef()
+			defer cwd.DecRef(t)
 
 			// Is there no slash at all?
 			if !strings.Contains(p, "/") {
@@ -289,7 +312,7 @@ func (s *SocketOperations) Bind(t *kernel.Task, sockaddr []byte) *syserr.Error {
 				name = p
 			} else {
 				root := t.FSContext().RootDirectory()
-				defer root.DecRef()
+				defer root.DecRef(t)
 				// Find the last path component, we know that something follows
 				// that final slash, otherwise extractPath() would have failed.
 				lastSlash := strings.LastIndex(p, "/")
@@ -305,16 +328,21 @@ func (s *SocketOperations) Bind(t *kernel.Task, sockaddr []byte) *syserr.Error {
 					// No path available.
 					return syserr.ErrNoSuchFile
 				}
-				defer d.DecRef()
+				defer d.DecRef(t)
 				name = p[lastSlash+1:]
 			}
 
 			// Create the socket.
+			//
+			// Note that the file permissions here are not set correctly (see
+			// gvisor.dev/issue/2324). There is no convenient way to get permissions
+			// on the socket referred to by s, so we will leave this discrepancy
+			// unresolved until VFS2 replaces this code.
 			childDir, err := d.Bind(t, t.FSContext().RootDirectory(), name, bep, fs.FilePermissions{User: fs.PermMask{Read: true}})
 			if err != nil {
 				return syserr.ErrPortInUse
 			}
-			childDir.DecRef()
+			childDir.DecRef(t)
 		}
 
 		return nil
@@ -345,41 +373,76 @@ func extractEndpoint(t *kernel.Task, sockaddr []byte) (transport.BoundEndpoint, 
 		return ep, nil
 	}
 
+	if kernel.VFS2Enabled {
+		p := fspath.Parse(path)
+		root := t.FSContext().RootDirectoryVFS2()
+		start := root
+		relPath := !p.Absolute
+		if relPath {
+			start = t.FSContext().WorkingDirectoryVFS2()
+		}
+		pop := vfs.PathOperation{
+			Root:               root,
+			Start:              start,
+			Path:               p,
+			FollowFinalSymlink: true,
+		}
+		ep, e := t.Kernel().VFS().BoundEndpointAt(t, t.Credentials(), &pop, &vfs.BoundEndpointOptions{path})
+		root.DecRef(t)
+		if relPath {
+			start.DecRef(t)
+		}
+		if e != nil {
+			return nil, syserr.FromError(e)
+		}
+		return ep, nil
+	}
+
 	// Find the node in the filesystem.
 	root := t.FSContext().RootDirectory()
 	cwd := t.FSContext().WorkingDirectory()
 	remainingTraversals := uint(fs.DefaultTraversalLimit)
 	d, e := t.MountNamespace().FindInode(t, root, cwd, path, &remainingTraversals)
-	cwd.DecRef()
-	root.DecRef()
+	cwd.DecRef(t)
+	root.DecRef(t)
 	if e != nil {
 		return nil, syserr.FromError(e)
 	}
 
 	// Extract the endpoint if one is there.
 	ep := d.Inode.BoundEndpoint(path)
-	d.DecRef()
+	d.DecRef(t)
 	if ep == nil {
 		// No socket!
 		return nil, syserr.ErrConnectionRefused
 	}
-
 	return ep, nil
 }
 
 // Connect implements the linux syscall connect(2) for unix sockets.
-func (s *SocketOperations) Connect(t *kernel.Task, sockaddr []byte, blocking bool) *syserr.Error {
+func (s *socketOpsCommon) Connect(t *kernel.Task, sockaddr []byte, blocking bool) *syserr.Error {
 	ep, err := extractEndpoint(t, sockaddr)
 	if err != nil {
 		return err
 	}
-	defer ep.Release()
+	defer ep.Release(t)
 
 	// Connect the server endpoint.
-	return s.ep.Connect(t, ep)
+	err = s.ep.Connect(t, ep)
+
+	if err == syserr.ErrWrongProtocolForSocket {
+		// Linux for abstract sockets returns ErrConnectionRefused
+		// instead of ErrWrongProtocolForSocket.
+		path, _ := extractPath(sockaddr)
+		if len(path) > 0 && path[0] == 0 {
+			err = syserr.ErrConnectionRefused
+		}
+	}
+
+	return err
 }
 
-// Writev implements fs.FileOperations.Write.
+// Write implements fs.FileOperations.Write.
 func (s *SocketOperations) Write(ctx context.Context, _ *fs.File, src usermem.IOSequence, _ int64) (int64, error) {
 	t := kernel.TaskFromContext(ctx)
 	ctrl := control.New(t, s.ep, nil)
@@ -399,7 +462,7 @@ func (s *SocketOperations) Write(ctx context.Context, _ *fs.File, src usermem.IO
 
 // SendMsg implements the linux syscall sendmsg(2) for unix sockets backed by
 // a transport.Endpoint.
-func (s *SocketOperations) SendMsg(t *kernel.Task, src usermem.IOSequence, to []byte, flags int, haveDeadline bool, deadline ktime.Time, controlMessages socket.ControlMessages) (int, *syserr.Error) {
+func (s *socketOpsCommon) SendMsg(t *kernel.Task, src usermem.IOSequence, to []byte, flags int, haveDeadline bool, deadline ktime.Time, controlMessages socket.ControlMessages) (int, *syserr.Error) {
 	w := EndpointWriter{
 		Ctx:      t,
 		Endpoint: s.ep,
@@ -407,15 +470,25 @@ func (s *SocketOperations) SendMsg(t *kernel.Task, src usermem.IOSequence, to []
 		To:       nil,
 	}
 	if len(to) > 0 {
-		ep, err := extractEndpoint(t, to)
-		if err != nil {
-			return 0, err
-		}
-		defer ep.Release()
-		w.To = ep
+		switch s.stype {
+		case linux.SOCK_SEQPACKET:
+			to = nil
+		case linux.SOCK_STREAM:
+			if s.State() == linux.SS_CONNECTED {
+				return 0, syserr.ErrAlreadyConnected
+			}
+			return 0, syserr.ErrNotSupported
+		default:
+			ep, err := extractEndpoint(t, to)
+			if err != nil {
+				return 0, err
+			}
+			defer ep.Release(t)
+			w.To = ep
 
-		if ep.Passcred() && w.Control.Credentials == nil {
-			w.Control.Credentials = control.MakeCreds(t)
+			if ep.Passcred() && w.Control.Credentials == nil {
+				w.Control.Credentials = control.MakeCreds(t)
+			}
 		}
 	}
 
@@ -453,27 +526,27 @@ func (s *SocketOperations) SendMsg(t *kernel.Task, src usermem.IOSequence, to []
 }
 
 // Passcred implements transport.Credentialer.Passcred.
-func (s *SocketOperations) Passcred() bool {
+func (s *socketOpsCommon) Passcred() bool {
 	return s.ep.Passcred()
 }
 
 // ConnectedPasscred implements transport.Credentialer.ConnectedPasscred.
-func (s *SocketOperations) ConnectedPasscred() bool {
+func (s *socketOpsCommon) ConnectedPasscred() bool {
 	return s.ep.ConnectedPasscred()
 }
 
 // Readiness implements waiter.Waitable.Readiness.
-func (s *SocketOperations) Readiness(mask waiter.EventMask) waiter.EventMask {
+func (s *socketOpsCommon) Readiness(mask waiter.EventMask) waiter.EventMask {
 	return s.ep.Readiness(mask)
 }
 
 // EventRegister implements waiter.Waitable.EventRegister.
-func (s *SocketOperations) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
+func (s *socketOpsCommon) EventRegister(e *waiter.Entry, mask waiter.EventMask) {
 	s.ep.EventRegister(e, mask)
 }
 
 // EventUnregister implements waiter.Waitable.EventUnregister.
-func (s *SocketOperations) EventUnregister(e *waiter.Entry) {
+func (s *socketOpsCommon) EventUnregister(e *waiter.Entry) {
 	s.ep.EventUnregister(e)
 }
 
@@ -485,7 +558,7 @@ func (s *SocketOperations) SetSockOpt(t *kernel.Task, level int, name int, optVa
 
 // Shutdown implements the linux syscall shutdown(2) for sockets backed by
 // a transport.Endpoint.
-func (s *SocketOperations) Shutdown(t *kernel.Task, how int) *syserr.Error {
+func (s *socketOpsCommon) Shutdown(t *kernel.Task, how int) *syserr.Error {
 	f, err := netstack.ConvertShutdown(how)
 	if err != nil {
 		return err
@@ -511,7 +584,7 @@ func (s *SocketOperations) Read(ctx context.Context, _ *fs.File, dst usermem.IOS
 
 // RecvMsg implements the linux syscall recvmsg(2) for sockets backed by
 // a transport.Endpoint.
-func (s *SocketOperations) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, haveDeadline bool, deadline ktime.Time, senderRequested bool, controlDataLen uint64) (n int, msgFlags int, senderAddr linux.SockAddr, senderAddrLen uint32, controlMessages socket.ControlMessages, err *syserr.Error) {
+func (s *socketOpsCommon) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags int, haveDeadline bool, deadline ktime.Time, senderRequested bool, controlDataLen uint64) (n int, msgFlags int, senderAddr linux.SockAddr, senderAddrLen uint32, controlMessages socket.ControlMessages, err *syserr.Error) {
 	trunc := flags&linux.MSG_TRUNC != 0
 	peek := flags&linux.MSG_PEEK != 0
 	dontWait := flags&linux.MSG_DONTWAIT != 0
@@ -648,12 +721,12 @@ func (s *SocketOperations) RecvMsg(t *kernel.Task, dst usermem.IOSequence, flags
 }
 
 // State implements socket.Socket.State.
-func (s *SocketOperations) State() uint32 {
+func (s *socketOpsCommon) State() uint32 {
 	return s.ep.State()
 }
 
 // Type implements socket.Socket.Type.
-func (s *SocketOperations) Type() (family int, skType linux.SockType, protocol int) {
+func (s *socketOpsCommon) Type() (family int, skType linux.SockType, protocol int) {
 	// Unix domain sockets always have a protocol of 0.
 	return linux.AF_UNIX, s.stype, 0
 }
@@ -706,4 +779,5 @@ func (*provider) Pair(t *kernel.Task, stype linux.SockType, protocol int) (*fs.F
 
 func init() {
 	socket.RegisterProvider(linux.AF_UNIX, &provider{})
+	socket.RegisterProviderVFS2(linux.AF_UNIX, &providerVFS2{})
 }

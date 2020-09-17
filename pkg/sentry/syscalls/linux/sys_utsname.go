@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// +build amd64 arm64
-
 package linux
 
 import (
@@ -48,7 +46,7 @@ func Uname(t *kernel.Task, args arch.SyscallArguments) (uintptr, *kernel.Syscall
 
 	// Copy out the result.
 	va := args[0].Pointer()
-	_, err := t.CopyOut(va, u)
+	_, err := u.CopyOut(t, va)
 	return 0, nil, err
 }
 
